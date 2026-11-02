@@ -7,3 +7,4 @@ libreoffice-core	https://github.com/LibreOffice/core.git	8586a91d32f765474042432
 intellij-community	https://github.com/JetBrains/intellij-community.git	b59eaea5edbcc3da085ce9864cd1fc23fdf28aa6	257118	994496266
 dotnet-runtime	https://github.com/dotnet/runtime.git	b4548da6edfce1996a1d6ffe1521c9ce6128be2e	54655	684265598
 freebsd-src	https://github.com/freebsd/freebsd-src.git	584f44221f45c5c26ec2a2888a3815c6f34bfad0	47418	722946191
+rust	https://github.com/rust-lang/rust.git	4c46afa63688fb473618f9b3553d70b0c15a88eb	62197	227274085
