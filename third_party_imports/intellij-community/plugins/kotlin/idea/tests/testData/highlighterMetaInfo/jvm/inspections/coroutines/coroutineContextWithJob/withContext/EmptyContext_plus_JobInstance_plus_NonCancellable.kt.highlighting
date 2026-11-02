@@ -1,0 +1,13 @@
+// HIGHLIGHT_WARNINGS
+// WITH_COROUTINES
+package test
+
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Job
+
+suspend fun test(job: Job) {
+    withContext(EmptyCoroutineContext + job + NonCancellable) {}
+}
+// TOOL: org.jetbrains.kotlin.idea.codeInsight.inspections.coroutines.CoroutineContextWithJobInspection

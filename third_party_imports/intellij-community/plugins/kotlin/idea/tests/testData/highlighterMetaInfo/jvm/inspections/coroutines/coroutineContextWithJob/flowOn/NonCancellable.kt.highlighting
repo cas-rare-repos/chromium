@@ -1,0 +1,11 @@
+// HIGHLIGHT_WARNINGS
+// WITH_COROUTINES
+package test
+
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.*
+
+fun test(flow: Flow<Int>) {
+    flow.flowOn(NonCancellable)
+}
+// TOOL: org.jetbrains.kotlin.idea.codeInsight.inspections.coroutines.CoroutineContextWithJobInspection
