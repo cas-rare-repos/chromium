@@ -3,3 +3,4 @@ linux	https://github.com/torvalds/linux.git	6628e7d4c6b25c8d18f1345e3a20d21829aa
 llvm-project	https://github.com/llvm/llvm-project.git	f736bb6506716f6054229a18213990ef27218e9d	181365	2371267805
 gcc	https://github.com/gcc-mirror/gcc.git	9ca1edea42f626844222ac4befa1e97675514b6c	156705	802208838
 openjdk	https://github.com/openjdk/jdk.git	774c5d1afcd3e158d13b8943fd74c2bca2dbe75c	71293	700646084
+libreoffice-core	https://github.com/LibreOffice/core.git	8586a91d32f765474042432e9ef627f1018da132	139861	1110572658
