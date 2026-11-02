@@ -1,0 +1,253 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Reflection;
+using System.Reflection.Runtime.Assemblies;
+using System.Runtime.CompilerServices;
+
+using Internal.LowLevelLinq;
+using Internal.Metadata.NativeFormat;
+using Internal.Reflection.Core;
+
+using NativeFormatAssemblyFlags = global::Internal.Metadata.NativeFormat.AssemblyFlags;
+using NativeFormatModifiedType = global::Internal.Metadata.NativeFormat.ModifiedType;
+
+namespace System.Reflection.Runtime.General
+{
+    //
+    // Collect various metadata reading tasks for better chunking...
+    //
+    [CLSCompliant(false)]
+    public static class NativeFormatMetadataReaderExtensions
+    {
+        public static bool StringOrNullEquals(this ConstantStringValueHandle handle, string valueOrNull, MetadataReader reader)
+        {
+            if (valueOrNull == null)
+                return handle.IsNil;
+            if (handle.IsNil)
+                return false;
+            return handle.StringEquals(valueOrNull, reader);
+        }
+
+        public static int AsInt(this MethodHandle methodHandle)
+        {
+            unsafe
+            {
+                return *(int*)&methodHandle;
+            }
+        }
+
+        // Return any custom modifiers modifying the passed-in type and whose required/optional bit matches the passed in boolean.
+        // Because this is intended to service the GetCustomModifiers() apis, this helper will always return a freshly allocated array
+        // safe for returning to api callers.
+        internal static Type[] GetCustomModifiers(this Handle handle, MetadataReader reader, TypeContext typeContext, bool optional)
+        {
+            HandleType handleType = handle.HandleType;
+            Debug.Assert(handleType == HandleType.TypeDefinition || handleType == HandleType.TypeReference || handleType == HandleType.TypeSpecification || handleType == HandleType.ModifiedType);
+            if (handleType != HandleType.ModifiedType)
+                return Array.Empty<Type>();
+
+            ArrayBuilder<Type> customModifiers = default;
+            do
+            {
+                NativeFormatModifiedType modifiedType = handle.ToModifiedTypeHandle(reader).GetModifiedType(reader);
+                if (optional == modifiedType.IsOptional)
+                {
+                    Type customModifier = modifiedType.ModifierType.Resolve(reader, typeContext).ToType();
+                    customModifiers.Add(customModifier);
+                }
+
+                handle = modifiedType.Type;
+                handleType = handle.HandleType;
+            }
+            while (handleType == HandleType.ModifiedType);
+            customModifiers.AsSpan().Reverse();
+            return customModifiers.ToArray();
+        }
+
+        public static Handle SkipCustomModifiers(this Handle handle, MetadataReader reader)
+        {
+            HandleType handleType = handle.HandleType;
+            Debug.Assert(handleType == HandleType.TypeDefinition || handleType == HandleType.TypeReference || handleType == HandleType.TypeSpecification || handleType == HandleType.ModifiedType);
+            if (handleType != HandleType.ModifiedType)
+                return handle;
+
+            do
+            {
+                NativeFormatModifiedType modifiedType = handle.ToModifiedTypeHandle(reader).GetModifiedType(reader);
+                handle = modifiedType.Type;
+                handleType = handle.HandleType;
+            }
+            while (handleType == HandleType.ModifiedType);
+
+            return handle;
+        }
+
+        public static MethodSignature ParseMethodSignature(this Handle handle, MetadataReader reader)
+        {
+            return handle.ToMethodSignatureHandle(reader).GetMethodSignature(reader);
+        }
+
+        //
+        // Used to split methods between DeclaredMethods and DeclaredConstructors.
+        //
+        public static bool IsConstructor(this MethodHandle methodHandle, MetadataReader reader)
+        {
+            Method method = methodHandle.GetMethod(reader);
+            return IsConstructor(ref method, reader);
+        }
+
+        // This is specially designed for a hot path so we make some compromises in the signature:
+        //
+        //     - "method" is passed by reference even though no side-effects are intended.
+        //
+        public static bool IsConstructor(ref Method method, MetadataReader reader)
+        {
+            if ((method.Flags & (MethodAttributes.RTSpecialName | MethodAttributes.SpecialName)) != (MethodAttributes.RTSpecialName | MethodAttributes.SpecialName))
+                return false;
+
+            ConstantStringValueHandle nameHandle = method.Name;
+            return nameHandle.StringEquals(ConstructorInfo.ConstructorName, reader) || nameHandle.StringEquals(ConstructorInfo.TypeConstructorName, reader);
+        }
+
+        public static object? ParseConstantValue(this ConstantHandle handle, MetadataReader reader)
+        {
+            Constant constant = handle.GetConstant(reader);
+            BlobReader blob = new BlobReader(constant.Blob.AsSpan());
+            return constant.TypeCode switch
+            {
+                ConstantTypeCode.Boolean => blob.ReadBoolean(),
+                ConstantTypeCode.Char => blob.ReadChar(),
+                ConstantTypeCode.Byte => blob.ReadByte(),
+                ConstantTypeCode.SByte => blob.ReadSByte(),
+                ConstantTypeCode.Int16 => blob.ReadInt16(),
+                ConstantTypeCode.UInt16 => blob.ReadUInt16(),
+                ConstantTypeCode.Int32 => blob.ReadInt32(),
+                ConstantTypeCode.UInt32 => blob.ReadUInt32(),
+                ConstantTypeCode.Int64 => blob.ReadInt64(),
+                ConstantTypeCode.UInt64 => blob.ReadUInt64(),
+                ConstantTypeCode.Single => blob.ReadSingle(),
+                ConstantTypeCode.Double => blob.ReadDouble(),
+                ConstantTypeCode.String => blob.ReadStringHandle().GetString(reader),
+                ConstantTypeCode.NullReference => null,
+                _ => throw new BadImageFormatException()
+            };
+        }
+
+        public static Handle GetAttributeTypeHandle(this CustomAttribute customAttribute,
+                                                    MetadataReader reader)
+        {
+            HandleType constructorHandleType = customAttribute.Constructor.HandleType;
+
+            if (constructorHandleType == HandleType.QualifiedMethod)
+                return customAttribute.Constructor.ToQualifiedMethodHandle(reader).GetQualifiedMethod(reader).EnclosingType;
+            else if (constructorHandleType == HandleType.MemberReference)
+                return customAttribute.Constructor.ToMemberReferenceHandle(reader).GetMemberReference(reader).Parent;
+            else
+                throw new BadImageFormatException();
+        }
+
+        //
+        // Lightweight check to see if a custom attribute's is of a well-known type.
+        //
+        // This check performs without instantiating the Type object and bloating memory usage. On the flip side,
+        // it doesn't check on whether the type is defined in a paricular assembly. The desktop CLR typically doesn't
+        // check this either so this is useful from a compat perspective as well.
+        //
+        public static bool IsCustomAttributeOfType(this CustomAttributeHandle customAttributeHandle,
+                                                   MetadataReader reader,
+                                                   string namespaceName,
+                                                   string name)
+        {
+            Handle typeHandle = customAttributeHandle.GetCustomAttribute(reader).GetAttributeTypeHandle(reader);
+            HandleType handleType = typeHandle.HandleType;
+            if (handleType == HandleType.TypeDefinition)
+            {
+                TypeDefinition typeDefinition = typeHandle.ToTypeDefinitionHandle(reader).GetTypeDefinition(reader);
+                if (!typeDefinition.Name.StringEquals(name, reader))
+                    return false;
+                Handle namespaceOrEnclosingType = typeDefinition.NamespaceOrEnclosingType;
+                if (namespaceOrEnclosingType.HandleType != HandleType.NamespaceDefinition)
+                    return false;
+                NamespaceDefinition namespaceDefinition = namespaceOrEnclosingType.ToNamespaceDefinitionHandle(reader).GetNamespaceDefinition(reader);
+                return namespaceDefinition.Name.StringOrNullEquals(namespaceName, reader);
+            }
+            else if (handleType == HandleType.TypeReference)
+            {
+                TypeReference typeReference = typeHandle.ToTypeReferenceHandle(reader).GetTypeReference(reader);
+                if (!typeReference.TypeName.StringEquals(name, reader))
+                    return false;
+                Handle namespaceOrEnclosingType = typeReference.NamespaceOrEnclosingType;
+                if (namespaceOrEnclosingType.HandleType != HandleType.NamespaceReference)
+                    return false;
+                NamespaceReference namespaceReference = namespaceOrEnclosingType.ToNamespaceReferenceHandle(reader).GetNamespaceReference(reader);
+                return namespaceReference.Name.StringOrNullEquals(namespaceName, reader);
+            }
+            else if (handleType == HandleType.TypeSpecification)
+                return false;
+            else
+                throw new NotSupportedException();
+        }
+
+
+        public static string ToNamespaceName(this NamespaceDefinitionHandle namespaceDefinitionHandle, MetadataReader reader)
+        {
+            return namespaceDefinitionHandle.GetNamespaceDefinition(reader).Name.GetStringOrNull(reader) ?? string.Empty;
+        }
+
+        public static IEnumerable<TypeDefinitionHandle> GetTransitiveTypes(this MetadataReader reader, IEnumerable<TypeDefinitionHandle> typeDefinitionHandles, bool publicOnly)
+        {
+            foreach (TypeDefinitionHandle typeDefinitionHandle in typeDefinitionHandles)
+            {
+                TypeDefinition typeDefinition = typeDefinitionHandle.GetTypeDefinition(reader);
+
+                if (publicOnly)
+                {
+                    TypeAttributes visibility = typeDefinition.Flags & TypeAttributes.VisibilityMask;
+                    if (visibility != TypeAttributes.Public && visibility != TypeAttributes.NestedPublic)
+                        continue;
+                }
+
+                yield return typeDefinitionHandle;
+
+                foreach (TypeDefinitionHandle nestedTypeDefinitionHandle in GetTransitiveTypes(reader, typeDefinition.NestedTypes.AsEnumerable(), publicOnly))
+                    yield return nestedTypeDefinitionHandle;
+            }
+        }
+
+        public static string ToFullyQualifiedTypeName(this NamespaceReferenceHandle namespaceReferenceHandle, string typeName, MetadataReader reader)
+        {
+            string namespaceName = namespaceReferenceHandle.GetNamespaceReference(reader).Name.GetStringOrNull(reader);
+            return namespaceName is null ? typeName : namespaceName + "." + typeName;
+        }
+
+        public static IEnumerable<TypeDefinitionHandle> AsEnumerable(this TypeDefinitionHandleCollection collection)
+        {
+            foreach (TypeDefinitionHandle handle in collection)
+                yield return handle;
+        }
+
+        public static IEnumerable<TypeDefinitionHandle> AsEnumerable(this TypeDefinitionHandleHashtable hashtable)
+        {
+            foreach (TypeDefinitionHandle handle in hashtable)
+                yield return handle;
+        }
+
+        public static byte[] ToArray(this ByteCollection collection)
+        {
+            int count = collection.Count;
+            byte[] result = new byte[count];
+            int i = 0;
+            foreach (byte element in collection)
+            {
+                result[i++] = element;
+            }
+            Debug.Assert(i == count);
+            return result;
+        }
+    }
+}

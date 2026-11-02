@@ -1,0 +1,101 @@
+parameters:
+  - name: platforms
+    type: object
+  - name: testGroup
+    type: string
+    default: outerloop
+  - name: isaScenarios
+    type: object
+    default:
+      jitstress-isas-arm:
+        - jitstress_isas_nohwintrinsic
+      jitstress-isas-avx512:
+        - jitstress_isas_x86_evex
+        - jitstress_isas_x86_noavx512
+        - jitstressregs0x2000
+      jitstress-isas-x86:
+        - jitstress_isas_nohwintrinsic
+        - jitstress_isas_x86_evex
+        - jitstress_isas_x86_noavx
+        - jitstress_isas_x86_noavx2
+        - jitstress_isas_x86_noavx512
+        - jitstress_isas_x86_vectort128
+        - jitstress_isas_x86_vectort512
+        - jitstress_isas_x86_noavx512_vectort128
+        - jitstress_isas_1_x86_evex
+        - jitstress_isas_1_x86_noavx
+        - jitstress_isas_1_x86_noavx2
+        - jitstress_isas_1_x86_noavx512
+        - jitstress_isas_1_x86_vectort128
+        - jitstress_isas_1_x86_vectort512
+        - jitstress_isas_1_x86_noavx512_vectort128
+        - jitstress_isas_2_x86_evex
+        - jitstress_isas_2_x86_noavx
+        - jitstress_isas_2_x86_noavx2
+        - jitstress_isas_2_x86_noavx512
+        - jitstress_isas_2_x86_vectort128
+        - jitstress_isas_2_x86_vectort512
+        - jitstress_isas_2_x86_noavx512_vectort128
+  - name: stages
+    type: stageList
+    default: []
+
+extends:
+  template:  /eng/pipelines/common/templates/pipeline-with-resources.yml
+  parameters:
+    stages:
+    - stage: Build
+      jobs:
+
+      - template: /eng/pipelines/common/platform-matrix.yml
+        parameters:
+          jobTemplate: /eng/pipelines/common/global-build-job.yml
+          buildConfig: checked
+          platforms: ${{ parameters.platforms }}
+          jobParameters:
+            buildArgs: -s clr+libs -c $(_BuildConfig) -lc Release
+            postBuildSteps:
+              - template: /eng/pipelines/coreclr/templates/build-native-test-assets-step.yml
+              - template: /eng/pipelines/common/upload-artifact-step.yml
+                parameters:
+                  rootFolder: $(Build.SourcesDirectory)/artifacts/bin
+                  includeRootFolder: false
+                  archiveType: $(archiveType)
+                  archiveExtension: $(archiveExtension)
+                  tarCompression: $(tarCompression)
+                  artifactName: BuildArtifacts_$(osGroup)$(osSubgroup)_$(archType)_$(_BuildConfig)
+                  displayName: Build Assets
+            extraVariablesTemplates:
+              - template: /eng/pipelines/common/templates/runtimes/native-test-assets-variables.yml
+                parameters:
+                  testGroup: ${{ parameters.testGroup }}
+
+      - template: /eng/pipelines/common/platform-matrix.yml
+        parameters:
+          jobTemplate: /eng/pipelines/common/templates/runtimes/build-test-job.yml
+          buildConfig: checked
+          platforms:
+          - CoreClrTestBuildHost # Either osx_x64 or linux_x64
+          jobParameters:
+            testGroup: ${{ parameters.testGroup }}
+
+      - template: /eng/pipelines/common/platform-matrix.yml
+        parameters:
+          jobTemplate: /eng/pipelines/common/templates/runtimes/run-test-job.yml
+          buildConfig: checked
+          platforms: ${{ parameters.platforms }}
+          helixQueueGroup: ci
+          helixQueuesTemplate: /eng/pipelines/coreclr/templates/helix-queues-setup.yml
+          jobParameters:
+            testGroup: ${{ parameters.testGroup }}
+            ${{ if in(parameters.testGroup, 'jitstress-isas-arm', 'jitstress-isas-avx512', 'jitstress-isas-x86') }}:
+              jitIsaStressScenarios: ${{ parameters.isaScenarios[parameters.testGroup] }}
+            liveLibrariesBuildConfig: Release
+            unifiedArtifactsName: BuildArtifacts_$(osGroup)$(osSubgroup)_$(archType)_$(_BuildConfig)
+    - ${{ if in(parameters.testGroup, 'jitstress-isas-arm', 'jitstress-isas-avx512', 'jitstress-isas-x86') }}:
+      - template: /eng/pipelines/coreclr/templates/jit-isas-libraries.yml
+        parameters:
+          platforms: ${{ parameters.platforms }}
+          scenarios: ${{ parameters.isaScenarios[parameters.testGroup] }}
+    - ${{ each stage in parameters.stages }}:
+        - ${{ stage }}

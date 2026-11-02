@@ -5,3 +5,4 @@ gcc	https://github.com/gcc-mirror/gcc.git	9ca1edea42f626844222ac4befa1e97675514b
 openjdk	https://github.com/openjdk/jdk.git	774c5d1afcd3e158d13b8943fd74c2bca2dbe75c	71293	700646084
 libreoffice-core	https://github.com/LibreOffice/core.git	8586a91d32f765474042432e9ef627f1018da132	139861	1110572658
 intellij-community	https://github.com/JetBrains/intellij-community.git	b59eaea5edbcc3da085ce9864cd1fc23fdf28aa6	257118	994496266
+dotnet-runtime	https://github.com/dotnet/runtime.git	b4548da6edfce1996a1d6ffe1521c9ce6128be2e	54655	684265598

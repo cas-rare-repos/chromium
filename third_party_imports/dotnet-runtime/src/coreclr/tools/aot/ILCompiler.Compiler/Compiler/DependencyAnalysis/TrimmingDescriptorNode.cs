@@ -1,0 +1,56 @@
+﻿//Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Collections.Generic;
+using System.IO;
+
+using ILCompiler.DependencyAnalysisFramework;
+
+namespace ILCompiler.DependencyAnalysis
+{
+    public class TrimmingDescriptorNode : DependencyNodeCore<NodeFactory>
+#if !ILTRIM
+#pragma warning disable SA1001
+        , ICompilationRootProvider
+#pragma warning restore SA1001
+#endif
+    {
+        private readonly string _fileName;
+
+        public TrimmingDescriptorNode(string fileName)
+        {
+            _fileName = fileName;
+        }
+
+        public override void AddStaticDependencies(DependencySink sink, NodeFactory factory)
+        {
+            using (Stream fs = File.OpenRead(_fileName))
+            {
+#if ILTRIM
+                foreach (DependencyListEntry dependency in DescriptorMarker.GetDependencies(factory.Logger, factory, fs, default, default, _fileName, factory.Settings.FeatureSettings))
+#else
+                var metadataManager = (UsageBasedMetadataManager)factory.MetadataManager;
+                foreach (DependencyListEntry dependency in DescriptorMarker.GetDependencies(metadataManager.Logger, factory, fs, default, default, _fileName, metadataManager.FeatureSwitches))
+#endif
+                {
+                    sink.Add(dependency);
+                }
+            }
+        }
+
+        protected override string GetName(NodeFactory factory)
+        {
+            return $"Descriptor in {_fileName}";
+        }
+
+        public override bool InterestingForDynamicDependencyAnalysis => false;
+        public override bool HasDynamicDependencies => false;
+        public override bool HasConditionalStaticDependencies => false;
+        public override bool StaticDependenciesAreComputed => true;
+        public override void AddConditionalDependencies(DependencySink sink, NodeFactory context) { }
+        public override void SearchDynamicDependencies(List<DependencyNodeCore<NodeFactory>> markedNodes, int firstNode, DependencySink sink, NodeFactory context) { }
+#if !ILTRIM
+        void ICompilationRootProvider.AddCompilationRoots(IRootingServiceProvider rootProvider) => rootProvider.AddCompilationRoot(this, "Descriptor from command line");
+#endif
+    }
+}

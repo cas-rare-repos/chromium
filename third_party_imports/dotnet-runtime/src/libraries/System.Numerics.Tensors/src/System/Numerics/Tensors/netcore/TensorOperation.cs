@@ -1,0 +1,3974 @@
+﻿// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Buffers;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+namespace System.Numerics.Tensors
+{
+    internal static class TensorOperation
+    {
+        // Constructing slices costs more than indexed iteration for tiny tensors.
+        internal const int MinSlicedOperationLength = 32;
+
+        // Three indexed traversals make binary slicing pay off at 16 elements rather than 32.
+        private const int MinSlicedBinaryOperationLength = 16;
+
+        private static bool ValidateSourceOverlap<TSource, TDestination>(
+            in ReadOnlyTensorSpan<TSource> source, in TensorSpan<TDestination> destination, bool isCopy = false)
+        {
+            if (source.FlattenedLength == 0 || destination.FlattenedLength == 0)
+            {
+                return false;
+            }
+
+            if (!source._shape.Overlaps(in source._reference, ref destination._reference, destination._shape.LinearLength))
+            {
+                return false;
+            }
+
+            if (typeof(TSource) == typeof(TDestination))
+            {
+                ref TSource destinationReference = ref Unsafe.As<TDestination, TSource>(ref destination._reference);
+                if (Unsafe.AreSame(ref Unsafe.AsRef(in source._reference), ref destinationReference)
+                    && TensorShape.AreLayoutsTheSame(source._shape, destination._shape))
+                {
+                    if (isCopy)
+                    {
+                        return true;
+                    }
+                    if (!source._shape.IsSelfOverlapping)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            throw new ArgumentException(SR.Argument_OverlappingTensorLayoutsNotSupported, nameof(destination));
+        }
+
+        private static ReadOnlySpan<T> AsDenseSpan<T>(in ReadOnlyTensorSpan<T> source)
+            => MemoryMarshal.CreateReadOnlySpan(in source._reference, checked((int)source.FlattenedLength));
+
+        internal static ReadOnlySpan<T> AsDenseSpan<T>(in ReadOnlyTensorSpan<T> source, nint offset, int length)
+        {
+            Debug.Assert(source.IsDense);
+            Debug.Assert(offset >= 0 && offset <= source.FlattenedLength);
+            Debug.Assert(length >= 0 && length <= source.FlattenedLength - offset);
+
+            return MemoryMarshal.CreateReadOnlySpan(in Unsafe.Add(ref Unsafe.AsRef(in source._reference), offset), length);
+        }
+
+        internal static Span<T> AsDenseSpan<T>(in TensorSpan<T> destination)
+            => AsDenseSpan(destination, 0, checked((int)destination.FlattenedLength));
+
+        internal static Span<T> AsDenseSpan<T>(in TensorSpan<T> destination, nint offset, int length)
+        {
+            Debug.Assert(destination.IsDense);
+            Debug.Assert(offset >= 0 && offset <= destination.FlattenedLength);
+            Debug.Assert(length >= 0 && length <= destination.FlattenedLength - offset);
+
+            return MemoryMarshal.CreateSpan(ref Unsafe.Add(ref destination._reference, offset), length);
+        }
+
+        internal static void CopyDense<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, nint copyLength, nint destinationOffset = 0)
+        {
+            Debug.Assert(source.IsDense && destination.IsDense);
+            Debug.Assert(copyLength >= 0 && copyLength <= source.FlattenedLength);
+            Debug.Assert(destinationOffset >= 0 && copyLength <= destination.FlattenedLength - destinationOffset);
+
+            ref T target = ref Unsafe.Add(ref destination._reference, destinationOffset);
+            nint byteOffset = Unsafe.ByteOffset(ref Unsafe.AsRef(in source._reference), ref target);
+            nuint byteLength = checked((nuint)copyLength * (nuint)Unsafe.SizeOf<T>());
+            bool copyBackwards = byteOffset > 0 && (nuint)byteOffset < byteLength;
+
+            // Span.CopyTo handles overlap within a chunk; chunk order must also
+            // preserve source data when the destination starts inside the source.
+            for (nint copied = 0; copied < copyLength;)
+            {
+                int count = (int)Math.Min(copyLength - copied, int.MaxValue);
+                nint offset = copyBackwards ? copyLength - copied - count : copied;
+                MemoryMarshal.CreateReadOnlySpan(in Unsafe.Add(ref Unsafe.AsRef(in source._reference), offset), count)
+                    .CopyTo(AsDenseSpan(destination, destinationOffset + offset, count));
+                copied += count;
+            }
+        }
+
+        internal static bool TryCopyDenseSlices<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, nint copyLength, nint destinationOffset = 0)
+        {
+            Debug.Assert(copyLength > 0 && copyLength <= source.FlattenedLength);
+            Debug.Assert(destinationOffset >= 0 && copyLength <= destination.FlattenedLength - destinationOffset);
+            Debug.Assert((source.IsDense && destination.IsDense)
+                || !source._shape.Overlaps(in source._reference, ref destination._reference, destination._shape.LinearLength));
+
+            int sourceDimension = source.IsDense ? -1 : GetDenseSliceDimension(source._shape, source._shape);
+            if (destination.IsDense)
+            {
+                if (source.IsDense)
+                {
+                    CopyDense(source, destination, copyLength, destinationOffset);
+                }
+                else if (sourceDimension < 0)
+                {
+                    CopyEnumeratedSource(source, destination, copyLength, -1, destinationOffset);
+                }
+                else
+                {
+                    CopySourceDenseSlices(source, destination, copyLength, sourceDimension, destinationOffset);
+                }
+
+                return true;
+            }
+
+            int destinationDimension = GetDenseSliceDimension(destination._shape, destination._shape);
+            if (destinationDimension < 0)
+            {
+                return false;
+            }
+
+            if (!source.IsDense && sourceDimension < 0)
+            {
+                CopyEnumeratedSource(source, destination, copyLength, destinationDimension, destinationOffset);
+            }
+            else
+            {
+                CopyBetweenDenseSlices(source, destination, copyLength, sourceDimension, destinationDimension, destinationOffset);
+            }
+
+            return true;
+        }
+
+        private static void CopySourceDenseSlices<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, nint copyLength,
+            int dimension, nint destinationOffset)
+        {
+            ReadOnlyTensorDimensionSpan<T> slices = source.GetDimensionSpan(dimension);
+            for (nint copied = 0, i = 0; copied < copyLength; i++)
+            {
+                ReadOnlyTensorSpan<T> slice = slices[i];
+                int count = (int)Math.Min(slice.FlattenedLength, copyLength - copied);
+                MemoryMarshal.CreateReadOnlySpan(in slice._reference, count)
+                    .CopyTo(AsDenseSpan(destination, destinationOffset + copied, count));
+                copied += count;
+            }
+        }
+
+        internal static bool TryReverseDenseSlices<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination)
+        {
+            // Compatibility requires matching source broadcasts wherever logical
+            // destination elements alias, so changing traversal order is safe.
+            ReadOnlyTensorSpan<T> input = source.Lengths.SequenceEqual(destination.Lengths) ? source : BroadcastSource(source, destination._shape);
+            int sourceDimension = input.IsDense ? -1 : GetDenseSliceDimension(input._shape, input._shape);
+            int destinationDimension = destination.IsDense ? -1 : GetDenseSliceDimension(destination._shape, destination._shape);
+            if (!input.IsDense && sourceDimension < 0)
+            {
+                if (!destination.IsDense && destinationDimension < 0)
+                {
+                    return false;
+                }
+
+                ReverseEnumeratedSource(input, destination, destinationDimension);
+            }
+            else if (!destination.IsDense && destinationDimension < 0)
+            {
+                ReverseEnumeratedDestination(input, destination, sourceDimension);
+            }
+            else
+            {
+                ReverseBetweenDenseSlices(input, destination, sourceDimension, destinationDimension);
+            }
+
+            return true;
+        }
+
+        private static void ReverseEnumeratedSource<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, int dimension)
+        {
+            ReadOnlyTensorSpan<T>.Enumerator enumerator = source.GetEnumerator();
+            TensorDimensionSpan<T> slices = destination.IsDense ? default : destination.GetDimensionSpan(dimension);
+            nint sliceLength = destination.IsDense ? destination.FlattenedLength : slices[0].FlattenedLength;
+            for (nint copied = 0; copied < destination.FlattenedLength;)
+            {
+                nint position = destination.FlattenedLength - copied - 1;
+                nint offset = position % sliceLength + 1;
+                int count = (int)Math.Min(offset, int.MaxValue);
+                Span<T> target = destination.IsDense
+                    ? AsDenseSpan(destination, position - count + 1, count)
+                    : AsDenseSpan(slices[position / sliceLength], offset - count, count);
+                for (int i = target.Length - 1; i >= 0; i--)
+                {
+                    bool moved = enumerator.MoveNext();
+                    Debug.Assert(moved);
+                    target[i] = enumerator.Current;
+                }
+                copied += count;
+            }
+        }
+
+        private static void ReverseEnumeratedDestination<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, int dimension)
+        {
+            TensorSpan<T>.Enumerator enumerator = destination.GetEnumerator();
+            ReadOnlyTensorDimensionSpan<T> slices = source.IsDense ? default : source.GetDimensionSpan(dimension);
+            nint sliceLength = source.IsDense ? source.FlattenedLength : slices[0].FlattenedLength;
+            for (nint copied = 0; copied < source.FlattenedLength;)
+            {
+                nint position = source.FlattenedLength - copied - 1;
+                nint offset = position % sliceLength + 1;
+                int count = (int)Math.Min(offset, int.MaxValue);
+                ReadOnlySpan<T> input = source.IsDense
+                    ? AsDenseSpan(source, position - count + 1, count)
+                    : AsDenseSpan(slices[position / sliceLength], offset - count, count);
+                for (int i = input.Length - 1; i >= 0; i--)
+                {
+                    bool moved = enumerator.MoveNext();
+                    Debug.Assert(moved);
+                    enumerator.Current = input[i];
+                }
+                copied += count;
+            }
+        }
+
+        private static void CopyBetweenDenseSlices<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, nint copyLength,
+            int sourceDimension, int destinationDimension, nint destinationOffset)
+        {
+            TensorDimensionSpan<T> destinationSlices = destination.GetDimensionSpan(destinationDimension);
+            nint destinationSliceLength = destinationSlices[0].FlattenedLength;
+            ReadOnlyTensorDimensionSpan<T> sourceSlices = source.IsDense ? default : source.GetDimensionSpan(sourceDimension);
+            nint sourceSliceLength = source.IsDense ? source.FlattenedLength : sourceSlices[0].FlattenedLength;
+            nint sourceIndex = 0;
+            nint sourceOffset = 0;
+            nint targetOffset = destinationOffset % destinationSliceLength;
+            nint targetIndex = destinationOffset / destinationSliceLength;
+
+            for (nint copied = 0; copied < copyLength;)
+            {
+                int count = (int)Math.Min(Math.Min(sourceSliceLength - sourceOffset, destinationSliceLength - targetOffset), copyLength - copied);
+                ref readonly T sourceReference = ref source._reference;
+                if (!source.IsDense)
+                {
+                    sourceReference = ref sourceSlices[sourceIndex]._reference;
+                }
+
+                MemoryMarshal.CreateReadOnlySpan(in Unsafe.Add(ref Unsafe.AsRef(in sourceReference), sourceOffset), count)
+                    .CopyTo(AsDenseSpan(destinationSlices[targetIndex], targetOffset, count));
+                copied += count;
+                sourceOffset += count;
+                targetOffset += count;
+                if (sourceOffset == sourceSliceLength)
+                {
+                    sourceOffset = 0;
+                    sourceIndex++;
+                }
+                if (targetOffset == destinationSliceLength)
+                {
+                    targetOffset = 0;
+                    targetIndex++;
+                }
+            }
+        }
+
+        private static void ReverseBetweenDenseSlices<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination,
+            int sourceDimension, int destinationDimension)
+        {
+            TensorDimensionSpan<T> destinationSlices = destination.IsDense ? default : destination.GetDimensionSpan(destinationDimension);
+            nint destinationSliceLength = destination.IsDense ? destination.FlattenedLength : destinationSlices[0].FlattenedLength;
+            ReadOnlyTensorDimensionSpan<T> sourceSlices = source.IsDense ? default : source.GetDimensionSpan(sourceDimension);
+            nint sourceSliceLength = source.IsDense ? source.FlattenedLength : sourceSlices[0].FlattenedLength;
+            nint sourceIndex = sourceSlices.Length - 1;
+            nint sourceOffset = sourceSliceLength;
+            nint targetOffset = 0;
+            nint targetIndex = 0;
+
+            for (nint copied = 0; copied < destination.FlattenedLength;)
+            {
+                int count = (int)Math.Min(Math.Min(sourceOffset, destinationSliceLength - targetOffset), int.MaxValue);
+                ref readonly T sourceReference = ref source._reference;
+                if (!source.IsDense)
+                {
+                    sourceReference = ref sourceSlices[sourceIndex]._reference;
+                }
+
+                Span<T> target = destination.IsDense
+                    ? AsDenseSpan(destination, copied, count)
+                    : AsDenseSpan(destinationSlices[targetIndex], targetOffset, count);
+                MemoryMarshal.CreateReadOnlySpan(in Unsafe.Add(ref Unsafe.AsRef(in sourceReference), sourceOffset - count), count)
+                    .CopyTo(target);
+                target.Reverse();
+                copied += count;
+                sourceOffset -= count;
+                targetOffset += count;
+                if (sourceOffset == 0)
+                {
+                    sourceOffset = sourceSliceLength;
+                    sourceIndex--;
+                }
+                if (targetOffset == destinationSliceLength)
+                {
+                    targetOffset = 0;
+                    targetIndex++;
+                }
+            }
+        }
+
+        private static void CopyEnumeratedSource<T>(in ReadOnlyTensorSpan<T> source, in TensorSpan<T> destination, nint copyLength,
+            int dimension, nint destinationOffset)
+        {
+            ReadOnlyTensorSpan<T>.Enumerator enumerator = source.GetEnumerator();
+            TensorDimensionSpan<T> slices = destination.IsDense ? default : destination.GetDimensionSpan(dimension);
+            nint sliceLength = destination.IsDense ? destination.FlattenedLength : slices[0].FlattenedLength;
+            for (nint copied = 0; copied < copyLength;)
+            {
+                nint position = destinationOffset + copied;
+                nint offset = position % sliceLength;
+                int count = (int)Math.Min(Math.Min(sliceLength - offset, copyLength - copied), int.MaxValue);
+                Span<T> target = destination.IsDense
+                    ? AsDenseSpan(destination, position, count)
+                    : AsDenseSpan(slices[position / sliceLength], offset, count);
+                foreach (ref T value in target)
+                {
+                    bool moved = enumerator.MoveNext();
+                    Debug.Assert(moved);
+                    value = enumerator.Current;
+                }
+                copied += count;
+            }
+        }
+
+        private static void InvokeDenseChunks<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> source, in TensorSpan<TResult> destination)
+            where TOperation : IUnaryOperation_Tensor<TArg, TResult>
+        {
+            for (nint offset = 0; offset < destination.FlattenedLength;)
+            {
+                int count = (int)Math.Min(destination.FlattenedLength - offset, int.MaxValue);
+                TOperation.Invoke(AsDenseSpan(source, offset, count), AsDenseSpan(destination, offset, count));
+                offset += count;
+            }
+        }
+
+        private static void InvokeDenseChunks<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x,
+            in ReadOnlyTensorSpan<TArg2> y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg1, TArg2, TResult>
+        {
+            for (nint offset = 0; offset < destination.FlattenedLength;)
+            {
+                int count = (int)Math.Min(destination.FlattenedLength - offset, int.MaxValue);
+                TOperation.Invoke(AsDenseSpan(x, offset, count), AsDenseSpan(y, offset, count), AsDenseSpan(destination, offset, count));
+                offset += count;
+            }
+        }
+
+        private static void InvokeDenseChunks<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x,
+            TArg2 y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg1, TArg2, TResult>
+        {
+            for (nint offset = 0; offset < destination.FlattenedLength;)
+            {
+                int count = (int)Math.Min(destination.FlattenedLength - offset, int.MaxValue);
+                TOperation.Invoke(AsDenseSpan(x, offset, count), y, AsDenseSpan(destination, offset, count));
+                offset += count;
+            }
+        }
+
+        private static void InvokeDenseChunks<TOperation, TArg, TResult>(TArg x, in ReadOnlyTensorSpan<TArg> y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Scalar_Tensor<TArg, TArg, TResult>
+        {
+            for (nint offset = 0; offset < destination.FlattenedLength;)
+            {
+                int count = (int)Math.Min(destination.FlattenedLength - offset, int.MaxValue);
+                TOperation.Invoke(x, AsDenseSpan(y, offset, count), AsDenseSpan(destination, offset, count));
+                offset += count;
+            }
+        }
+
+        internal static void CopyDense<T>(ref readonly T source, ref T destination, nint length, int maximumChunkLength = int.MaxValue)
+        {
+            Debug.Assert(length >= 0 && maximumChunkLength > 0);
+            // Copy overlapping chunks in memmove order. Each span is bounded by
+            // int.MaxValue, while offsets and the total length remain native-sized.
+            bool backwards = Unsafe.IsAddressGreaterThan(ref destination, ref Unsafe.AsRef(in source));
+            nint remaining = length;
+            while (remaining > 0)
+            {
+                int count = (int)Math.Min(remaining, maximumChunkLength);
+                nint offset = backwards ? remaining - count : length - remaining;
+                MemoryMarshal.CreateReadOnlySpan(in Unsafe.Add(ref Unsafe.AsRef(in source), offset), count)
+                    .CopyTo(MemoryMarshal.CreateSpan(ref Unsafe.Add(ref destination, offset), count));
+                remaining -= count;
+            }
+        }
+
+        private static ReadOnlyTensorSpan<T> BroadcastSource<T>(in ReadOnlyTensorSpan<T> source, in TensorShape destination)
+        {
+            if (destination.FlattenedLength == 0)
+            {
+                return source;
+            }
+
+            ReadOnlySpan<nint> sourceLengths = source.Lengths;
+            ReadOnlySpan<nint> sourceStrides = source.Strides;
+            int destinationRank = destination.Rank;
+            scoped Span<nint> strides = RentedBuffer.CreateUninitialized(destinationRank, out RentedBuffer<nint> rentedBuffer);
+            int rankDifference = destinationRank - sourceLengths.Length;
+
+            for (int i = 0; i < destinationRank; i++)
+            {
+                int sourceIndex = i - rankDifference;
+                strides[i] = sourceIndex < 0 || sourceLengths[sourceIndex] == 1 ? 0 : sourceStrides[sourceIndex];
+            }
+
+            TensorShape shape = TensorShape.Create(in source._reference, source._shape.LinearLength, destination.Lengths, strides, source.IsPinned);
+            rentedBuffer.Dispose();
+            return new ReadOnlyTensorSpan<T>(in source._reference, in shape);
+        }
+
+        internal static int GetDenseSliceDimension(in TensorShape source, in TensorShape destination, in TensorShape other = default,
+            int minimumLength = MinSlicedOperationLength)
+        {
+            if (destination.FlattenedLength < minimumLength)
+            {
+                return -1;
+            }
+
+            ReadOnlySpan<nint> lengths = destination.Lengths;
+            bool hasOther = other.Rank != 0;
+            Debug.Assert(source.Lengths.SequenceEqual(lengths));
+            Debug.Assert(!hasOther || other.Lengths.SequenceEqual(lengths));
+            ReadOnlySpan<nint> sourceStrides = source.Strides;
+            ReadOnlySpan<nint> destinationStrides = destination.Strides;
+            ReadOnlySpan<nint> otherStrides = other.Strides;
+            nint contiguousLength = 1;
+            int dimension = -1;
+
+            for (int i = lengths.Length - 1; i > 0; i--)
+            {
+                nint length = lengths[i];
+                if (length > 1 &&
+                    (sourceStrides[i] != contiguousLength ||
+                     destinationStrides[i] != contiguousLength ||
+                     (hasOther && otherStrides[i] != contiguousLength)))
+                {
+                    break;
+                }
+                if (length > int.MaxValue / contiguousLength)
+                {
+                    break;
+                }
+
+                contiguousLength *= length;
+                if (contiguousLength > 1)
+                {
+                    dimension = i - 1;
+                }
+            }
+
+            return dimension;
+        }
+
+        internal static nint IndexOfMinMax<T, TOperator>(in ReadOnlyTensorSpan<T> x, int maximumChunkLength = int.MaxValue)
+            where T : INumber<T>
+            where TOperator : struct, TensorPrimitives.IIndexOfMinMaxOperator<T>
+        {
+            Debug.Assert(maximumChunkLength > 0);
+            nint flattenedLength = x.FlattenedLength;
+            if (x.IsDense && flattenedLength <= maximumChunkLength)
+            {
+                return TensorPrimitives.IndexOfMinMaxCore<T, TOperator>(AsDenseSpan(x));
+            }
+
+            return IndexOfMinMaxFallback<T, TOperator>(x, maximumChunkLength);
+        }
+
+        private static nint IndexOfMinMaxFallback<T, TOperator>(in ReadOnlyTensorSpan<T> x, int maximumChunkLength)
+            where T : INumber<T>
+            where TOperator : struct, TensorPrimitives.IIndexOfMinMaxOperator<T>
+        {
+            nint flattenedLength = x.FlattenedLength;
+            if (flattenedLength == 0)
+            {
+                return -1;
+            }
+
+            T result = x._reference;
+            nint resultIndex = 0;
+            if (T.IsNaN(result))
+            {
+                return resultIndex;
+            }
+
+            if (x.IsDense)
+            {
+                for (nint offset = 0; offset < flattenedLength;)
+                {
+                    int length = (int)Math.Min(flattenedLength - offset, maximumChunkLength);
+                    ReadOnlySpan<T> chunk = MemoryMarshal.CreateReadOnlySpan(in Unsafe.Add(ref x._reference, offset), length);
+                    if (AggregateIndexOfMinMax<T, TOperator>(chunk, offset, ref result, ref resultIndex))
+                    {
+                        return resultIndex;
+                    }
+                    offset += length;
+                }
+                return resultIndex;
+            }
+
+            int dimension = GetDenseSliceDimension(x._shape, x._shape);
+            if (dimension >= 0)
+            {
+                ReadOnlyTensorDimensionSpan<T> slices = x.GetDimensionSpan(dimension);
+                nint offset = 0;
+                nint sliceCount = slices.Length;
+                for (nint i = 0; i < sliceCount; i++)
+                {
+                    ReadOnlyTensorSpan<T> slice = slices[i];
+                    ReadOnlySpan<T> values = AsDenseSpan(slice);
+                    for (int start = 0; start < values.Length;)
+                    {
+                        int length = Math.Min(values.Length - start, maximumChunkLength);
+                        if (AggregateIndexOfMinMax<T, TOperator>(values.Slice(start, length), offset, ref result, ref resultIndex))
+                        {
+                            return resultIndex;
+                        }
+                        start += length;
+                        offset += length;
+                    }
+                }
+                return resultIndex;
+            }
+
+            if (flattenedLength <= maximumChunkLength)
+            {
+                T[] flattened = ArrayPool<T>.Shared.Rent((int)flattenedLength);
+                try
+                {
+                    x.FlattenTo(flattened);
+                    return TensorPrimitives.IndexOfMinMaxCore<T, TOperator>(flattened.AsSpan(0, (int)flattenedLength));
+                }
+                finally
+                {
+                    ArrayPool<T>.Shared.Return(flattened, RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+                }
+            }
+
+            // 1024-element blocks amortize primitive calls while keeping float/double scratch space within L1 cache.
+            int bufferLength = (int)Math.Min(flattenedLength, Math.Min(maximumChunkLength, 1024));
+            scoped Span<nint> indexes = RentedBuffer.Create(x.Rank, x.Strides, out nint linearOffset, out RentedBuffer<nint> rentedBuffer);
+            T[]? buffer = null;
+            try
+            {
+                buffer = ArrayPool<T>.Shared.Rent(bufferLength);
+                for (nint offset = 0; offset < flattenedLength;)
+                {
+                    int length = (int)Math.Min(flattenedLength - offset, bufferLength);
+                    Span<T> chunk = buffer.AsSpan(0, length);
+                    for (int i = 0; i < chunk.Length; i++)
+                    {
+                        linearOffset = x._shape.AdjustToNextIndex(x._shape, linearOffset, indexes);
+                        chunk[i] = Unsafe.Add(ref x._reference, linearOffset);
+                    }
+                    if (AggregateIndexOfMinMax<T, TOperator>(chunk, offset, ref result, ref resultIndex))
+                    {
+                        return resultIndex;
+                    }
+                    offset += length;
+                }
+            }
+            finally
+            {
+                if (buffer is not null)
+                {
+                    ArrayPool<T>.Shared.Return(buffer, RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+                }
+                rentedBuffer.Dispose();
+            }
+
+            return resultIndex;
+        }
+
+        private static bool AggregateIndexOfMinMax<T, TOperator>(ReadOnlySpan<T> values, nint offset, ref T result, ref nint resultIndex)
+            where T : INumber<T>
+            where TOperator : struct, TensorPrimitives.IIndexOfMinMaxOperator<T>
+        {
+            int index = TensorPrimitives.IndexOfMinMaxCore<T, TOperator>(values);
+            T current = values[index];
+            bool isNaN = T.IsNaN(current);
+            if (isNaN || TOperator.Compare(current, result))
+            {
+                result = current;
+                resultIndex = offset + index;
+            }
+
+            return isNaN;
+        }
+
+        public static void Invoke<TOperation, T>(in TensorSpan<T> x)
+            where TOperation : IOperation<T>
+        {
+            if (x.IsDense && x.FlattenedLength <= int.MaxValue)
+            {
+                TOperation.Invoke(AsDenseSpan(x));
+                return;
+            }
+
+            if (x.IsDense)
+            {
+                for (nint offset = 0; offset < x.FlattenedLength;)
+                {
+                    int count = (int)Math.Min(x.FlattenedLength - offset, int.MaxValue);
+                    TOperation.Invoke(AsDenseSpan(x, offset, count));
+                    offset += count;
+                }
+                return;
+            }
+
+            if (GetDenseSliceDimension(x._shape, x._shape) is int dimension && dimension >= 0)
+            {
+                TensorDimensionSpan<T> slices = x.GetDimensionSpan(dimension);
+                for (nint i = 0; i < slices.Length; i++)
+                {
+                    TensorSpan<T> slice = slices[i];
+                    TOperation.Invoke(AsDenseSpan(slice));
+                }
+                return;
+            }
+
+            scoped Span<nint> indexes = RentedBuffer.Create(x.Rank, x.Strides, out nint linearOffset, out RentedBuffer<nint> rentedBuffer);
+
+            for (nint i = 0; i < x.FlattenedLength; i++)
+            {
+                linearOffset = x._shape.AdjustToNextIndex(x._shape, linearOffset, indexes);
+                TOperation.Invoke(
+                    ref Unsafe.Add(ref x._reference, linearOffset)
+                );
+            }
+
+            rentedBuffer.Dispose();
+        }
+
+        public static bool Invoke<TOperation, TArg>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, bool>
+        {
+            if (x.FlattenedLength == 0 && y.FlattenedLength == 0)
+            {
+                return true;
+            }
+
+            if (x.IsDense && y.IsDense && x.Lengths.SequenceEqual(y.Lengths))
+            {
+                return TestDense<TOperation, TArg>(x, y);
+            }
+
+            return InvokeStridedPredicate<TOperation, TArg>(x, y);
+        }
+
+        private static bool TestDense<TOperation, TArg>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y, nint start = 0)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, bool>
+        {
+            bool result = true;
+            for (nint i = start; i < x.FlattenedLength; i++)
+            {
+                TOperation.Invoke(in Unsafe.Add(ref x._reference, i), in Unsafe.Add(ref y._reference, i), ref result);
+                if (!result)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool InvokeStridedPredicate<TOperation, TArg>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, bool>
+        {
+            bool result = false;
+
+            TensorShape destinationShape = GetBroadcastShape(x._shape, y._shape);
+            if (destinationShape.FlattenedLength == 0)
+            {
+                return true;
+            }
+
+            TOperation.Invoke(in x._reference, in y._reference, ref result);
+            if (!result)
+            {
+                return false;
+            }
+
+            ReadOnlyTensorSpan<TArg> optimizedX = x.Lengths.SequenceEqual(destinationShape.Lengths) ? x : BroadcastSource(x, destinationShape);
+            ReadOnlyTensorSpan<TArg> optimizedY = y.Lengths.SequenceEqual(destinationShape.Lengths) ? y : BroadcastSource(y, destinationShape);
+            if (optimizedX.IsDense && optimizedY.IsDense && optimizedX.Lengths.SequenceEqual(optimizedY.Lengths))
+            {
+                return TestDense<TOperation, TArg>(optimizedX, optimizedY, 1);
+            }
+
+            int dimension = GetDenseSliceDimension(optimizedX._shape, destinationShape, optimizedY._shape, MinSlicedBinaryOperationLength);
+            if (dimension >= 0)
+            {
+                ReadOnlyTensorDimensionSpan<TArg> xSlices = optimizedX.GetDimensionSpan(dimension);
+                ReadOnlyTensorDimensionSpan<TArg> ySlices = optimizedY.GetDimensionSpan(dimension);
+                for (nint i = 0; i < xSlices.Length; i++)
+                {
+                    if (!TestDense<TOperation, TArg>(xSlices[i], ySlices[i], i == 0 ? 1 : 0))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            scoped Span<nint> xIndexes = RentedBuffer.Create(destinationShape.Rank, x.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+            scoped Span<nint> yIndexes = RentedBuffer.Create(destinationShape.Rank, y.Strides, out nint yLinearOffset, out RentedBuffer<nint> yRentedBuffer);
+
+            xLinearOffset = x._shape.AdjustToNextIndex(destinationShape, xLinearOffset, xIndexes);
+            yLinearOffset = y._shape.AdjustToNextIndex(destinationShape, yLinearOffset, yIndexes);
+            for (nint i = 1; i < destinationShape.FlattenedLength; i++)
+            {
+                xLinearOffset = x._shape.AdjustToNextIndex(destinationShape, xLinearOffset, xIndexes);
+                yLinearOffset = y._shape.AdjustToNextIndex(destinationShape, yLinearOffset, yIndexes);
+
+                 TOperation.Invoke(
+                    in Unsafe.Add(ref x._reference, xLinearOffset),
+                    in Unsafe.Add(ref y._reference, yLinearOffset),
+                    ref result
+                );
+
+                if (!result)
+                {
+                    break;
+                }
+            }
+
+            xRentedBuffer.Dispose();
+            yRentedBuffer.Dispose();
+
+            return (destinationShape.FlattenedLength == 0) || result;
+        }
+
+        private static TensorShape GetBroadcastShape(in TensorShape x, in TensorShape y)
+        {
+            x = ref TensorShape.Normalize(x);
+            y = ref TensorShape.Normalize(y);
+
+            if (TensorShape.AreLengthsTheSame(x, y))
+            {
+                return x;
+            }
+
+            int rank = Math.Max(x.Rank, y.Rank);
+            scoped Span<nint> lengths = RentedBuffer.CreateUninitialized(rank, out RentedBuffer<nint> rentedBuffer);
+            ReadOnlySpan<nint> xLengths = x.Lengths;
+            ReadOnlySpan<nint> yLengths = y.Lengths;
+            for (int i = 0; i < rank; i++)
+            {
+                nint xLength = i < rank - x.Rank ? 1 : xLengths[i - (rank - x.Rank)];
+                nint yLength = i < rank - y.Rank ? 1 : yLengths[i - (rank - y.Rank)];
+                lengths[i] = xLength == 1 ? yLength : xLength;
+            }
+
+            TensorShape shape = TensorShape.Create(lengths, [], pinned: false);
+            rentedBuffer.Dispose();
+            return shape;
+        }
+
+        public static bool Invoke<TOperation, TArg>(in ReadOnlyTensorSpan<TArg> x, TArg y)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg, bool>
+        {
+            if (x.FlattenedLength == 0)
+            {
+                return true;
+            }
+
+            if (x.IsDense)
+            {
+                return TestDense<TOperation, TArg>(x, y);
+            }
+
+            return InvokeStridedPredicate<TOperation, TArg>(x, y);
+        }
+
+        private static bool TestDense<TOperation, TArg>(in ReadOnlyTensorSpan<TArg> x, TArg y, nint start = 0)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg, bool>
+        {
+            bool result = true;
+            for (nint i = start; i < x.FlattenedLength; i++)
+            {
+                TOperation.Invoke(in Unsafe.Add(ref x._reference, i), y, ref result);
+                if (!result)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool InvokeStridedPredicate<TOperation, TArg>(in ReadOnlyTensorSpan<TArg> x, TArg y)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg, bool>
+        {
+            bool result = false;
+
+            TOperation.Invoke(in x._reference, y, ref result);
+            if (!result)
+            {
+                return false;
+            }
+
+            int dimension = GetDenseSliceDimension(x._shape, x._shape);
+            if (dimension >= 0)
+            {
+                ReadOnlyTensorDimensionSpan<TArg> slices = x.GetDimensionSpan(dimension);
+                for (nint i = 0; i < slices.Length; i++)
+                {
+                    if (!TestDense<TOperation, TArg>(slices[i], y, i == 0 ? 1 : 0))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            scoped Span<nint> xIndexes = RentedBuffer.Create(x.Rank, x.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+
+            xLinearOffset = x._shape.AdjustToNextIndex(x._shape, xLinearOffset, xIndexes);
+            for (nint i = 1; i < x.FlattenedLength; i++)
+            {
+                xLinearOffset = x._shape.AdjustToNextIndex(x._shape, xLinearOffset, xIndexes);
+
+                TOperation.Invoke(
+                    in Unsafe.Add(ref x._reference, xLinearOffset),
+                    y,
+                    ref result
+                );
+
+                if (!result)
+                {
+                    break;
+                }
+            }
+
+            xRentedBuffer.Dispose();
+            return (x.FlattenedLength == 0) || result;
+        }
+
+        public static void Invoke<TOperation, TArg, TResult>(in TensorSpan<TResult> destination, TArg scalar)
+            where TOperation : IUnaryOperation_Scalar<TArg, TResult>
+        {
+            if (destination.IsDense && destination.FlattenedLength <= int.MaxValue)
+            {
+                TOperation.Invoke(AsDenseSpan(destination), scalar);
+                return;
+            }
+
+            if (destination.IsDense)
+            {
+                for (nint offset = 0; offset < destination.FlattenedLength;)
+                {
+                    int count = (int)Math.Min(destination.FlattenedLength - offset, int.MaxValue);
+                    TOperation.Invoke(AsDenseSpan(destination, offset, count), scalar);
+                    offset += count;
+                }
+                return;
+            }
+
+            if (GetDenseSliceDimension(destination._shape, destination._shape) is int dimension && dimension >= 0)
+            {
+                TensorDimensionSpan<TResult> slices = destination.GetDimensionSpan(dimension);
+                for (nint i = 0; i < slices.Length; i++)
+                {
+                    TensorSpan<TResult> slice = slices[i];
+                    TOperation.Invoke(AsDenseSpan(slice), scalar);
+                }
+                return;
+            }
+
+            scoped Span<nint> indexes = RentedBuffer.Create(destination.Rank, destination.Strides, out nint linearOffset, out RentedBuffer<nint> rentedBuffer);
+
+            for (nint i = 0; i < destination.FlattenedLength; i++)
+            {
+                linearOffset = destination._shape.AdjustToNextIndex(destination._shape, linearOffset, indexes);
+                TOperation.Invoke(
+                    ref Unsafe.Add(ref destination._reference, linearOffset),
+                    scalar
+                );
+            }
+
+            rentedBuffer.Dispose();
+        }
+
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in TensorSpan<TResult> destination)
+            where TOperation : IUnaryOperation_Tensor<TArg, TResult>
+        {
+            nint sourceLength = x.FlattenedLength;
+            nint destinationLength = destination.FlattenedLength;
+            bool isCopy = typeof(TOperation) == typeof(CopyTo<TArg>) && typeof(TArg) == typeof(TResult);
+            if (isCopy)
+            {
+                ref TArg destinationReference = ref Unsafe.As<TResult, TArg>(ref destination._reference);
+                if (x.IsDense && destination.IsDense && sourceLength == destinationLength)
+                {
+                    if (sourceLength <= int.MaxValue)
+                    {
+                        MemoryMarshal.CreateReadOnlySpan(in x._reference, (int)sourceLength)
+                            .CopyTo(MemoryMarshal.CreateSpan(ref destinationReference, (int)destinationLength));
+                    }
+                    else
+                    {
+                        CopyDense(in x._reference, ref destinationReference, sourceLength);
+                    }
+                    return;
+                }
+            }
+
+            if (ValidateSourceOverlap(x, destination, isCopy))
+            {
+                return;
+            }
+            ReadOnlySpan<nint> destinationLengths = destination.Lengths;
+            ReadOnlyTensorSpan<TArg> optimizedSource = x.Lengths.SequenceEqual(destinationLengths) ? x : BroadcastSource(x, destination._shape);
+            if (destinationLength != 0)
+            {
+                if (optimizedSource.IsDense && destination.IsDense && destinationLength <= int.MaxValue)
+                {
+                    TOperation.Invoke(AsDenseSpan(optimizedSource), AsDenseSpan(destination));
+                    return;
+                }
+
+                if (optimizedSource.IsDense && destination.IsDense)
+                {
+                    InvokeDenseChunks<TOperation, TArg, TResult>(optimizedSource, destination);
+                    return;
+                }
+
+                if (isCopy && destination.FlattenedLength >= MinSlicedOperationLength)
+                {
+                    ref TArg destinationReference = ref Unsafe.As<TResult, TArg>(ref destination._reference);
+                    if (TryCopyDenseSlices(optimizedSource, new TensorSpan<TArg>(ref destinationReference, destination._shape), destination.FlattenedLength))
+                    {
+                        return;
+                    }
+                }
+
+                int dimension = GetDenseSliceDimension(optimizedSource._shape, destination._shape);
+                if (dimension >= 0)
+                {
+                    ReadOnlyTensorDimensionSpan<TArg> sourceSlices = optimizedSource.GetDimensionSpan(dimension);
+                    TensorDimensionSpan<TResult> destinationSlices = destination.GetDimensionSpan(dimension);
+                    nint sliceCount = destinationSlices.Length;
+                    for (nint i = 0; i < sliceCount; i++)
+                    {
+                        ReadOnlyTensorSpan<TArg> sourceSlice = sourceSlices[i];
+                        TensorSpan<TResult> destinationSlice = destinationSlices[i];
+                        TOperation.Invoke(AsDenseSpan(sourceSlice), AsDenseSpan(destinationSlice));
+                    }
+                    return;
+                }
+            }
+            {
+                ReadOnlyTensorSpan<TArg> source = optimizedSource;
+                int destinationRank = destinationLengths.Length;
+                scoped Span<nint> xIndexes = RentedBuffer.Create(destinationRank, source.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+                scoped Span<nint> destinationIndexes = RentedBuffer.Create(destinationRank, destination.Strides, out nint destinationLinearOffset, out RentedBuffer<nint> destinationRentedBuffer);
+                for (nint i = 0; i < destinationLength; i++)
+                {
+                    xLinearOffset = source._shape.AdjustToNextIndex(destination._shape, xLinearOffset, xIndexes);
+                    destinationLinearOffset = destination._shape.AdjustToNextIndex(destination._shape, destinationLinearOffset, destinationIndexes);
+
+                    TOperation.Invoke(
+                        in Unsafe.Add(ref source._reference, xLinearOffset),
+                        ref Unsafe.Add(ref destination._reference, destinationLinearOffset)
+                    );
+                }
+                xRentedBuffer.Dispose();
+                destinationRentedBuffer.Dispose();
+            }
+        }
+
+        public static void ReverseInvoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in TensorSpan<TResult> destination)
+            where TOperation : IUnaryOperation_Tensor<TArg, TResult>
+        {
+            ReadOnlySpan<nint> destinationLengths = destination.Lengths;
+            int destinationRank = destinationLengths.Length;
+            nint destinationLength = destination.FlattenedLength;
+            ReadOnlyTensorSpan<TArg> source = x.Lengths.SequenceEqual(destinationLengths) ? x : BroadcastSource(x, destination._shape);
+            scoped Span<nint> xIndexes = RentedBuffer.Create(destinationRank, source.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+            scoped Span<nint> destinationIndexes = RentedBuffer.Create(destinationRank, destination.Strides, out nint negInnermostStride, out RentedBuffer<nint> destinationRentedBuffer);
+
+            for (int i = 0; i < destinationIndexes.Length - 1; i++)
+            {
+                destinationIndexes[i] = destinationLengths[i] - 1;
+            }
+            destinationIndexes[^1] = destinationLengths[^1];
+            nint destinationLinearOffset = destination._shape.LinearLength - 1 - negInnermostStride;
+
+            for (nint i = 0; i < destinationLength; i++)
+            {
+                xLinearOffset = source._shape.AdjustToNextIndex(destination._shape, xLinearOffset, xIndexes);
+                destinationLinearOffset = destination._shape.AdjustToPreviousIndex(destination._shape, destinationLinearOffset, destinationIndexes);
+
+                TOperation.Invoke(
+                    in Unsafe.Add(ref source._reference, xLinearOffset),
+                    ref Unsafe.Add(ref destination._reference, destinationLinearOffset)
+                );
+            }
+
+            xRentedBuffer.Dispose();
+            destinationRentedBuffer.Dispose();
+        }
+
+        // For copyto/flattento
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in Span<TResult> destination)
+            where TOperation : IUnaryOperation_Tensor<TArg, TResult>
+        {
+            Span<TResult> result = destination[..checked((int)x.FlattenedLength)];
+            if (typeof(TOperation) == typeof(CopyTo<TArg>) && typeof(TArg) == typeof(TResult))
+            {
+                ref TArg destinationReference = ref Unsafe.As<TResult, TArg>(ref MemoryMarshal.GetReference(result));
+                if (x.IsDense)
+                {
+                    MemoryMarshal.CreateReadOnlySpan(in x._reference, result.Length)
+                        .CopyTo(MemoryMarshal.CreateSpan(ref destinationReference, result.Length));
+                    return;
+                }
+
+                if (x._shape.Overlaps(in x._reference, ref destinationReference, result.Length))
+                {
+                    ThrowHelper.ThrowArgument_OverlappingTensorLayoutsNotSupported();
+                }
+
+                int dimension = result.Length >= MinSlicedOperationLength
+                    ? GetDenseSliceDimension(x._shape, x._shape)
+                    : -1;
+                if (dimension >= 0)
+                {
+                    ReadOnlyTensorDimensionSpan<TArg> slices = x.GetDimensionSpan(dimension);
+                    int destinationOffset = 0;
+
+                    nint sliceCount = slices.Length;
+                    for (nint i = 0; i < sliceCount; i++)
+                    {
+                        ReadOnlyTensorSpan<TArg> slice = slices[i];
+                        ReadOnlySpan<TArg> sourceSpan = AsDenseSpan(slice);
+                        TOperation.Invoke(sourceSpan, result.Slice(destinationOffset, sourceSpan.Length));
+                        destinationOffset += sourceSpan.Length;
+                    }
+                    return;
+                }
+            }
+
+            scoped Span<nint> xIndexes = RentedBuffer.Create(x.Rank, x.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+            nint destinationIndex = -1;
+
+            for (nint i = 0; i < result.Length; i++)
+            {
+                xLinearOffset = x._shape.AdjustToNextIndex(x._shape, xLinearOffset, xIndexes);
+                destinationIndex++;
+
+                TOperation.Invoke(
+                    in Unsafe.Add(ref x._reference, xLinearOffset),
+                    ref Unsafe.Add(ref result[0], destinationIndex)
+                );
+            }
+
+            xRentedBuffer.Dispose();
+        }
+
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, ref TResult destination)
+            where TOperation : IUnaryReduction_Tensor<TArg, TResult>
+        {
+            if (x.FlattenedLength == 0)
+            {
+                return;
+            }
+
+            if (x.IsDense)
+            {
+                ReduceDense<TOperation, TArg, TResult>(x, ref destination);
+                return;
+            }
+
+            InvokeStridedReduction<TOperation, TArg, TResult>(x, ref destination);
+        }
+
+        private static void InvokeStridedReduction<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, ref TResult destination)
+            where TOperation : IUnaryReduction_Tensor<TArg, TResult>
+        {
+            int dimension = GetDenseSliceDimension(x._shape, x._shape);
+            if (dimension >= 0)
+            {
+                ReadOnlyTensorDimensionSpan<TArg> slices = x.GetDimensionSpan(dimension);
+                for (nint i = 0; i < slices.Length; i++)
+                {
+                    ReduceDense<TOperation, TArg, TResult>(slices[i], ref destination);
+                }
+                return;
+            }
+
+            scoped Span<nint> xIndexes = RentedBuffer.Create(x.Rank, x.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+
+            for (nint i = 0; i < x.FlattenedLength; i++)
+            {
+                xLinearOffset = x._shape.AdjustToNextIndex(x._shape, xLinearOffset, xIndexes);
+
+                TOperation.Invoke(
+                    in Unsafe.Add(ref x._reference, xLinearOffset),
+                    ref destination
+                );
+            }
+
+            xRentedBuffer.Dispose();
+        }
+
+        private static void ReduceDense<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, ref TResult result)
+            where TOperation : IUnaryReduction_Tensor<TArg, TResult>
+        {
+            // Keep scalar evaluation order: vector or per-slice aggregates can
+            // change rounding, overflow, and custom numeric operator side effects.
+            for (nint i = 0; i < x.FlattenedLength; i++)
+            {
+                TOperation.Invoke(in Unsafe.Add(ref x._reference, i), ref result);
+            }
+        }
+
+        private static void ReduceDense<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, TResult>
+        {
+            for (nint i = 0; i < x.FlattenedLength; i++)
+            {
+                TOperation.Invoke(in Unsafe.Add(ref x._reference, i), in Unsafe.Add(ref y._reference, i), ref result);
+            }
+        }
+
+        private static void ReduceDense<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x, TArg2 y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg1, TArg2, TResult>
+        {
+            for (nint i = 0; i < x.FlattenedLength; i++)
+            {
+                TOperation.Invoke(in Unsafe.Add(ref x._reference, i), y, ref result);
+            }
+        }
+
+        public static void Invoke<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x, in ReadOnlyTensorSpan<TArg2> y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg1, TArg2, TResult>
+        {
+            ValidateSourceOverlap(x, destination);
+            ValidateSourceOverlap(y, destination);
+            ReadOnlySpan<nint> destinationLengths = destination.Lengths;
+            nint destinationLength = destination.FlattenedLength;
+            ReadOnlyTensorSpan<TArg1> optimizedX = x.Lengths.SequenceEqual(destinationLengths) ? x : BroadcastSource(x, destination._shape);
+            ReadOnlyTensorSpan<TArg2> optimizedY = y.Lengths.SequenceEqual(destinationLengths) ? y : BroadcastSource(y, destination._shape);
+            if (destinationLength != 0)
+            {
+                if (optimizedX.IsDense && optimizedY.IsDense && destination.IsDense && destinationLength <= int.MaxValue)
+                {
+                    TOperation.Invoke(AsDenseSpan(optimizedX), AsDenseSpan(optimizedY), AsDenseSpan(destination));
+                    return;
+                }
+
+                if (optimizedX.IsDense && optimizedY.IsDense && destination.IsDense)
+                {
+                    InvokeDenseChunks<TOperation, TArg1, TArg2, TResult>(optimizedX, optimizedY, destination);
+                    return;
+                }
+
+                int dimension = GetDenseSliceDimension(optimizedX._shape, destination._shape, optimizedY._shape, MinSlicedBinaryOperationLength);
+                if (dimension >= 0)
+                {
+                    ReadOnlyTensorDimensionSpan<TArg1> xSlices = optimizedX.GetDimensionSpan(dimension);
+                    ReadOnlyTensorDimensionSpan<TArg2> ySlices = optimizedY.GetDimensionSpan(dimension);
+                    TensorDimensionSpan<TResult> destinationSlices = destination.GetDimensionSpan(dimension);
+                    nint sliceCount = destinationSlices.Length;
+                    for (nint i = 0; i < sliceCount; i++)
+                    {
+                        ReadOnlyTensorSpan<TArg1> xSlice = xSlices[i];
+                        ReadOnlyTensorSpan<TArg2> ySlice = ySlices[i];
+                        TensorSpan<TResult> destinationSlice = destinationSlices[i];
+                        TOperation.Invoke(AsDenseSpan(xSlice), AsDenseSpan(ySlice), AsDenseSpan(destinationSlice));
+                    }
+                    return;
+                }
+            }
+            {
+                ReadOnlyTensorSpan<TArg1> left = optimizedX;
+                ReadOnlyTensorSpan<TArg2> right = optimizedY;
+                int destinationRank = destinationLengths.Length;
+                scoped Span<nint> xIndexes = RentedBuffer.Create(destinationRank, left.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+                scoped Span<nint> yIndexes = RentedBuffer.Create(destinationRank, right.Strides, out nint yLinearOffset, out RentedBuffer<nint> yRentedBuffer);
+                scoped Span<nint> destinationIndexes = RentedBuffer.Create(destinationRank, destination.Strides, out nint destinationLinearOffset, out RentedBuffer<nint> destinationRentedBuffer);
+                for (nint i = 0; i < destinationLength; i++)
+                {
+                    xLinearOffset = left._shape.AdjustToNextIndex(destination._shape, xLinearOffset, xIndexes);
+                    yLinearOffset = right._shape.AdjustToNextIndex(destination._shape, yLinearOffset, yIndexes);
+                    destinationLinearOffset = destination._shape.AdjustToNextIndex(destination._shape, destinationLinearOffset, destinationIndexes);
+
+                    TOperation.Invoke(
+                        in Unsafe.Add(ref left._reference, xLinearOffset),
+                        in Unsafe.Add(ref right._reference, yLinearOffset),
+                        ref Unsafe.Add(ref destination._reference, destinationLinearOffset)
+                    );
+                }
+                xRentedBuffer.Dispose();
+                yRentedBuffer.Dispose();
+                destinationRentedBuffer.Dispose();
+            }
+        }
+
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, TResult>
+        => Invoke<TOperation, TArg, TArg, TResult>(in x, in y, in destination);
+
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, TResult>
+        {
+            if (x.FlattenedLength == 0 && y.FlattenedLength == 0)
+            {
+                return;
+            }
+
+            if (x.IsDense && y.IsDense && x.Lengths.SequenceEqual(y.Lengths))
+            {
+                ReduceDense<TOperation, TArg, TResult>(x, y, ref result);
+                return;
+            }
+
+            InvokeStridedReduction<TOperation, TArg, TResult>(x, y, ref result);
+        }
+
+        private static void InvokeStridedReduction<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Tensor<TArg, TResult>
+        {
+            TensorShape destinationShape = GetBroadcastShape(x._shape, y._shape);
+            ReadOnlyTensorSpan<TArg> optimizedX = x.Lengths.SequenceEqual(destinationShape.Lengths) ? x : BroadcastSource(x, destinationShape);
+            ReadOnlyTensorSpan<TArg> optimizedY = y.Lengths.SequenceEqual(destinationShape.Lengths) ? y : BroadcastSource(y, destinationShape);
+            if (optimizedX.IsDense && optimizedY.IsDense && optimizedX.Lengths.SequenceEqual(optimizedY.Lengths))
+            {
+                ReduceDense<TOperation, TArg, TResult>(optimizedX, optimizedY, ref result);
+                return;
+            }
+
+            int dimension = GetDenseSliceDimension(optimizedX._shape, destinationShape, optimizedY._shape, MinSlicedBinaryOperationLength);
+            if (dimension >= 0)
+            {
+                ReadOnlyTensorDimensionSpan<TArg> xSlices = optimizedX.GetDimensionSpan(dimension);
+                ReadOnlyTensorDimensionSpan<TArg> ySlices = optimizedY.GetDimensionSpan(dimension);
+                for (nint i = 0; i < xSlices.Length; i++)
+                {
+                    ReduceDense<TOperation, TArg, TResult>(xSlices[i], ySlices[i], ref result);
+                }
+                return;
+            }
+
+            scoped Span<nint> xIndexes = RentedBuffer.Create(destinationShape.Rank, x.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+            scoped Span<nint> yIndexes = RentedBuffer.Create(destinationShape.Rank, y.Strides, out nint yLinearOffset, out RentedBuffer<nint> yRentedBuffer);
+
+            for (nint i = 0; i < destinationShape.FlattenedLength; i++)
+            {
+                xLinearOffset = x._shape.AdjustToNextIndex(destinationShape, xLinearOffset, xIndexes);
+                yLinearOffset = y._shape.AdjustToNextIndex(destinationShape, yLinearOffset, yIndexes);
+
+                TOperation.Invoke(
+                    in Unsafe.Add(ref x._reference, xLinearOffset),
+                    in Unsafe.Add(ref y._reference, yLinearOffset),
+                    ref result
+                );
+            }
+
+            xRentedBuffer.Dispose();
+            yRentedBuffer.Dispose();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, TArg y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg, TResult> => Invoke<TOperation, TArg, TArg, TResult>(in x, y, in destination);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, int y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Int32<TArg, TResult> => Invoke<TOperation, TArg, int, TResult>(in x, y, in destination);
+
+        public static void Invoke<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x, TArg2 y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg1, TArg2, TResult>
+        {
+            ValidateSourceOverlap(x, destination);
+            ReadOnlySpan<nint> destinationLengths = destination.Lengths;
+            nint destinationLength = destination.FlattenedLength;
+            ReadOnlyTensorSpan<TArg1> optimizedSource = x.Lengths.SequenceEqual(destinationLengths) ? x : BroadcastSource(x, destination._shape);
+            if (destinationLength != 0)
+            {
+                if (optimizedSource.IsDense && destination.IsDense && destinationLength <= int.MaxValue)
+                {
+                    TOperation.Invoke(AsDenseSpan(optimizedSource), y, AsDenseSpan(destination));
+                    return;
+                }
+
+                if (optimizedSource.IsDense && destination.IsDense)
+                {
+                    InvokeDenseChunks<TOperation, TArg1, TArg2, TResult>(optimizedSource, y, destination);
+                    return;
+                }
+
+                int dimension = GetDenseSliceDimension(optimizedSource._shape, destination._shape);
+                if (dimension >= 0)
+                {
+                    ReadOnlyTensorDimensionSpan<TArg1> sourceSlices = optimizedSource.GetDimensionSpan(dimension);
+                    TensorDimensionSpan<TResult> destinationSlices = destination.GetDimensionSpan(dimension);
+                    nint sliceCount = destinationSlices.Length;
+                    for (nint i = 0; i < sliceCount; i++)
+                    {
+                        ReadOnlyTensorSpan<TArg1> sourceSlice = sourceSlices[i];
+                        TensorSpan<TResult> destinationSlice = destinationSlices[i];
+                        TOperation.Invoke(AsDenseSpan(sourceSlice), y, AsDenseSpan(destinationSlice));
+                    }
+                    return;
+                }
+            }
+            {
+                ReadOnlyTensorSpan<TArg1> source = optimizedSource;
+                int destinationRank = destinationLengths.Length;
+                scoped Span<nint> xIndexes = RentedBuffer.Create(destinationRank, source.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+                scoped Span<nint> destinationIndexes = RentedBuffer.Create(destinationRank, destination.Strides, out nint destinationLinearOffset, out RentedBuffer<nint> destinationRentedBuffer);
+                for (nint i = 0; i < destinationLength; i++)
+                {
+                    xLinearOffset = source._shape.AdjustToNextIndex(destination._shape, xLinearOffset, xIndexes);
+                    destinationLinearOffset = destination._shape.AdjustToNextIndex(destination._shape, destinationLinearOffset, destinationIndexes);
+
+                    TOperation.Invoke(
+                        in Unsafe.Add(ref source._reference, xLinearOffset),
+                        y,
+                        ref Unsafe.Add(ref destination._reference, destinationLinearOffset)
+                    );
+                }
+                xRentedBuffer.Dispose();
+                destinationRentedBuffer.Dispose();
+            }
+        }
+
+        public static void Invoke<TOperation, TArg, TResult>(TArg x, in ReadOnlyTensorSpan<TArg> y, in TensorSpan<TResult> destination)
+            where TOperation : IBinaryOperation_Scalar_Tensor<TArg, TArg, TResult>
+        {
+            ValidateSourceOverlap(y, destination);
+            ReadOnlySpan<nint> destinationLengths = destination.Lengths;
+            nint destinationLength = destination.FlattenedLength;
+            ReadOnlyTensorSpan<TArg> optimizedSource = y.Lengths.SequenceEqual(destinationLengths) ? y : BroadcastSource(y, destination._shape);
+            if (destinationLength != 0)
+            {
+                if (optimizedSource.IsDense && destination.IsDense && destinationLength <= int.MaxValue)
+                {
+                    TOperation.Invoke(x, AsDenseSpan(optimizedSource), AsDenseSpan(destination));
+                    return;
+                }
+
+                if (optimizedSource.IsDense && destination.IsDense)
+                {
+                    InvokeDenseChunks<TOperation, TArg, TResult>(x, optimizedSource, destination);
+                    return;
+                }
+
+                int dimension = GetDenseSliceDimension(optimizedSource._shape, destination._shape);
+                if (dimension >= 0)
+                {
+                    ReadOnlyTensorDimensionSpan<TArg> sourceSlices = optimizedSource.GetDimensionSpan(dimension);
+                    TensorDimensionSpan<TResult> destinationSlices = destination.GetDimensionSpan(dimension);
+                    nint sliceCount = destinationSlices.Length;
+                    for (nint i = 0; i < sliceCount; i++)
+                    {
+                        ReadOnlyTensorSpan<TArg> sourceSlice = sourceSlices[i];
+                        TensorSpan<TResult> destinationSlice = destinationSlices[i];
+                        TOperation.Invoke(x, AsDenseSpan(sourceSlice), AsDenseSpan(destinationSlice));
+                    }
+                    return;
+                }
+            }
+            {
+                ReadOnlyTensorSpan<TArg> source = optimizedSource;
+                int destinationRank = destinationLengths.Length;
+                scoped Span<nint> xIndexes = RentedBuffer.Create(destinationRank, source.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+                scoped Span<nint> destinationIndexes = RentedBuffer.Create(destinationRank, destination.Strides, out nint destinationLinearOffset, out RentedBuffer<nint> destinationRentedBuffer);
+                for (nint i = 0; i < destinationLength; i++)
+                {
+                    xLinearOffset = source._shape.AdjustToNextIndex(destination._shape, xLinearOffset, xIndexes);
+                    destinationLinearOffset = destination._shape.AdjustToNextIndex(destination._shape, destinationLinearOffset, destinationIndexes);
+
+                    TOperation.Invoke(
+                        x,
+                        in Unsafe.Add(ref source._reference, xLinearOffset),
+                        ref Unsafe.Add(ref destination._reference, destinationLinearOffset)
+                    );
+                }
+                xRentedBuffer.Dispose();
+                destinationRentedBuffer.Dispose();
+            }
+        }
+
+        public static void Invoke<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x, TArg2 y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg1, TArg2, TResult>
+        {
+            if (x.FlattenedLength == 0)
+            {
+                return;
+            }
+
+            if (x.IsDense)
+            {
+                ReduceDense<TOperation, TArg1, TArg2, TResult>(x, y, ref result);
+                return;
+            }
+
+            InvokeStridedReduction<TOperation, TArg1, TArg2, TResult>(x, y, ref result);
+        }
+
+        private static void InvokeStridedReduction<TOperation, TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x, TArg2 y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg1, TArg2, TResult>
+        {
+            int dimension = GetDenseSliceDimension(x._shape, x._shape);
+            if (dimension >= 0)
+            {
+                ReadOnlyTensorDimensionSpan<TArg1> slices = x.GetDimensionSpan(dimension);
+                for (nint i = 0; i < slices.Length; i++)
+                {
+                    ReduceDense<TOperation, TArg1, TArg2, TResult>(slices[i], y, ref result);
+                }
+                return;
+            }
+
+            scoped Span<nint> xIndexes = RentedBuffer.Create(x.Rank, x.Strides, out nint xLinearOffset, out RentedBuffer<nint> xRentedBuffer);
+
+            for (nint i = 0; i < x.FlattenedLength; i++)
+            {
+                xLinearOffset = x._shape.AdjustToNextIndex(x._shape, xLinearOffset, xIndexes);
+
+                TOperation.Invoke(
+                    in Unsafe.Add(ref x._reference, xLinearOffset),
+                    y,
+                    ref result
+                );
+            }
+
+            xRentedBuffer.Dispose();
+        }
+
+        public static void Invoke<TOperation, TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, TArg y, ref TResult result)
+            where TOperation : IBinaryOperation_Tensor_Scalar<TArg, TResult> => Invoke<TOperation, TArg, TArg, TResult>(in x, y, ref result);
+
+        public static void ValidateCompatibility<TArg>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlySpan<nint> lengths)
+        {
+            // x can be broadcast to destination, not vice verse
+            if (!TensorShape.AreCompatible(lengths, x._shape))
+                ThrowHelper.ThrowArgument_LengthsNotCompatible();
+        }
+
+        public static void ValidateCompatibility<TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TResult> y)
+        {
+            // Can be bidirectional validation
+            if (!TensorShape.AreCompatible(x._shape, y._shape, true))
+                ThrowHelper.ThrowArgument_LengthsNotCompatible();
+        }
+
+        public static void ValidateCompatibility<TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in TensorSpan<TResult> destination)
+        {
+            // x can be broadcast to destination, not vice verse
+            if (!TensorShape.AreCompatible(destination._shape, x._shape, false))
+                ThrowHelper.ThrowArgument_LengthsNotCompatible();
+        }
+
+        public static void ValidateCompatibility<TArg1, TArg2, TResult>(in ReadOnlyTensorSpan<TArg1> x, in ReadOnlyTensorSpan<TArg2> y, in TensorSpan<TResult> destination)
+        {
+            // can do bidirectional validation between x and y, that result can then be broadcast to destination
+            if (TensorShape.AreCompatible(x._shape, y._shape, true))
+            {
+                if (TensorShape.AreCompatible(destination._shape, x._shape, false))
+                {
+                    if (TensorShape.AreCompatible(destination._shape, y._shape, false))
+                    {
+                        // all three are compatible
+                        return;
+                    }
+                }
+            }
+            ThrowHelper.ThrowArgument_LengthsNotCompatible();
+        }
+
+        public static void ValidateCompatibility<TArg, TResult>(in ReadOnlyTensorSpan<TArg> x, in ReadOnlyTensorSpan<TArg> y, out Tensor<TResult> destination)
+        {
+            // can do bidirectional validation between x and y, that result can then be broadcast to destination
+            if (TensorShape.AreCompatible(x._shape, y._shape, true))
+            {
+                ref readonly TensorShape xShape = ref TensorShape.Normalize(x._shape);
+                ref readonly TensorShape yShape = ref TensorShape.Normalize(y._shape);
+                ReadOnlySpan<nint> xLengths = xShape.Lengths;
+                ReadOnlySpan<nint> yLengths = yShape.Lengths;
+                int maxRank = Math.Max(xLengths.Length, yLengths.Length);
+
+                scoped Span<nint> resultLengths = RentedBuffer.CreateUninitialized(maxRank, out RentedBuffer<nint> resultLengthsRentedBuffer);
+
+                int xOffset = maxRank - xLengths.Length;
+                int yOffset = maxRank - yLengths.Length;
+
+                for (int i = 0; i < maxRank; i++)
+                {
+                    nint xLen = (i >= xOffset) ? xLengths[i - xOffset] : 1;
+                    nint yLen = (i >= yOffset) ? yLengths[i - yOffset] : 1;
+                    resultLengths[i] = (xLen == 1) ? yLen : xLen;
+                }
+
+                destination = Tensor.CreateFromShapeUninitialized<TResult>(resultLengths);
+
+                resultLengthsRentedBuffer.Dispose();
+
+                return;
+            }
+            destination = default!;
+            ThrowHelper.ThrowArgument_LengthsNotCompatible();
+        }
+
+        public readonly struct Clear<T>
+            : IOperation<T>
+        {
+            public static void Invoke(ref T destination)
+            {
+                destination = default!;
+            }
+
+            public static void Invoke(Span<T> destination)
+            {
+                destination.Clear();
+            }
+        }
+
+        public readonly struct CopyTo<T>
+            : IUnaryOperation_Tensor<T, T>
+        {
+            public static void Invoke(ref readonly T source, ref T destination)
+            {
+                destination = source;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> source, Span<T> destination)
+            {
+                source.CopyTo(destination);
+            }
+        }
+
+        public readonly struct Equals<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IEqualityOperators<T, T, bool>
+        {
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = (left == right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = (left == right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] == right);
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] == right[i]);
+                }
+            }
+        }
+
+        public readonly struct EqualsAny<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IEqualityOperators<T, T, bool>
+        {
+            // The main loop early exits at the first false condition, so we
+            // check x != y and returns false on first equal. The consumer will
+            // then negate whatever the main loop returns as `true` means none
+            // are equal.
+
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = (left != right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = (left != right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = (left[i] != right);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = (left[i] != right[i]);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+        }
+
+        #region TensorOperation Primitives
+        public readonly struct Abs<T>
+            : IUnaryOperation_Tensor<T, T>
+            where T : INumberBase<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Abs(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Abs(x, destination);
+            }
+        }
+
+        public readonly struct Acos<T>
+            : IUnaryOperation_Tensor<T, T>
+            where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Acos(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Acos(x, destination);
+            }
+        }
+
+        public readonly struct Acosh<T>
+            : IUnaryOperation_Tensor<T, T>
+            where T : IHyperbolicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Acosh(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Acosh(x, destination);
+            }
+        }
+
+        public readonly struct AcosPi<T>
+            : IUnaryOperation_Tensor<T, T>
+            where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.AcosPi(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.AcosPi(x, destination);
+            }
+        }
+
+        public readonly struct Add<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IAdditionOperators<T, T, T>, IAdditiveIdentity<T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x + y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Add(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x + y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Add(x, y, destination);
+            }
+        }
+
+        public readonly struct Asin<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Asin(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Asin(x, destination);
+            }
+        }
+
+        public readonly struct Asinh<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IHyperbolicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Asinh(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Asinh(x, destination);
+            }
+        }
+
+        public readonly struct AsinPi<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.AsinPi(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.AsinPi(x, destination);
+            }
+        }
+
+        public readonly struct Atan<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Atan(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Atan(x, destination);
+            }
+        }
+
+        public readonly struct Atan2<T>
+            : IBinaryOperation_Scalar_Tensor<T, T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IFloatingPointIeee754<T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Atan2(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = T.Atan2(x[i], y);
+                }
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Atan2(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Atan2(x, y, destination);
+            }
+
+            public static void Invoke(T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Atan2(x, y);
+            }
+
+            public static void Invoke(T x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = T.Atan2(x, y[i]);
+                }
+            }
+        }
+
+        public readonly struct Atan2Pi<T>
+            : IBinaryOperation_Scalar_Tensor<T, T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IFloatingPointIeee754<T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Atan2Pi(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = T.Atan2Pi(x[i], y);
+                }
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Atan2Pi(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Atan2Pi(x, y, destination);
+            }
+
+            public static void Invoke(T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Atan2Pi(x, y);
+            }
+
+            public static void Invoke(T x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = T.Atan2Pi(x, y[i]);
+                }
+            }
+        }
+
+        public readonly struct Atanh<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IHyperbolicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Atanh(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Atanh(x, destination);
+            }
+        }
+
+        public readonly struct AtanPi<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.AtanPi(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.AtanPi(x, destination);
+            }
+        }
+
+        public readonly struct BitwiseAnd<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IBitwiseOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x & y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.BitwiseAnd(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x & y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.BitwiseAnd(x, y, destination);
+            }
+        }
+
+        public readonly struct BitwiseOr<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IBitwiseOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x | y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.BitwiseOr(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x | y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.BitwiseOr(x, y, destination);
+            }
+        }
+
+        public readonly struct Cbrt<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IRootFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Cbrt(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Cbrt(x, destination);
+            }
+        }
+
+        public readonly struct Ceiling<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IFloatingPoint<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Ceiling(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Ceiling(x, destination);
+            }
+        }
+
+        public readonly struct ConvertChecked<TFrom, TTo>
+        : IUnaryOperation_Tensor<TFrom, TTo>
+        where TFrom : IEquatable<TFrom>, IEqualityOperators<TFrom, TFrom, bool>, INumberBase<TFrom>
+        where TTo : INumberBase<TTo>
+        {
+            public static void Invoke(ref readonly TFrom x, ref TTo destination)
+            {
+                destination = TTo.CreateChecked(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<TFrom> x, Span<TTo> destination)
+            {
+                TensorPrimitives.ConvertChecked(x, destination);
+            }
+        }
+
+        public readonly struct ConvertSaturating<TFrom, TTo>
+        : IUnaryOperation_Tensor<TFrom, TTo>
+        where TFrom : IEquatable<TFrom>, IEqualityOperators<TFrom, TFrom, bool>, INumberBase<TFrom>
+        where TTo : INumberBase<TTo>
+        {
+            public static void Invoke(ref readonly TFrom x, ref TTo destination)
+            {
+                destination = TTo.CreateSaturating(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<TFrom> x, Span<TTo> destination)
+            {
+                TensorPrimitives.ConvertSaturating(x, destination);
+            }
+        }
+
+        public readonly struct ConvertTruncating<TFrom, TTo>
+        : IUnaryOperation_Tensor<TFrom, TTo>
+        where TFrom : IEquatable<TFrom>, IEqualityOperators<TFrom, TFrom, bool>, INumberBase<TFrom>
+        where TTo : INumberBase<TTo>
+        {
+            public static void Invoke(ref readonly TFrom x, ref TTo destination)
+            {
+                destination = TTo.CreateTruncating(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<TFrom> x, Span<TTo> destination)
+            {
+                TensorPrimitives.ConvertTruncating(x, destination);
+            }
+        }
+
+        public readonly struct CopySign<T>
+        : IBinaryOperation_Tensor_Scalar<T, T>,
+          IBinaryOperation_Tensor_Tensor<T, T>
+        where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.CopySign(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.CopySign(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.CopySign(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.CopySign(x, y, destination);
+            }
+        }
+
+        public readonly struct Cos<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Cos(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Cos(x, destination);
+            }
+        }
+
+        public readonly struct Cosh<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IHyperbolicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Cosh(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Cosh(x, destination);
+            }
+        }
+
+        public struct CosineSimilarity<T>
+            : IBinaryOperation_Tensor_Tensor<T, ValueTuple<T, T, T>>
+            where T : IRootFunctions<T>
+        {
+            /// This method effectively computes <c>TensorPrimitives.Dot(x, y) / (<typeparamref name="T"/>.Sqrt(TensorPrimitives.SumOfSquares(x)) * <typeparamref name="T"/>.Sqrt(TensorPrimitives.SumOfSquares(y)).</c>
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref (T, T, T) destination)
+            {
+                destination.Item1 += (x * y);
+                destination.Item2 += (x * x);
+                destination.Item3 += (y * y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<(T, T, T)> destination)
+            {
+                destination[0].Item1 += TensorPrimitives.Dot(x, y);
+                destination[0].Item2 += TensorPrimitives.SumOfSquares(x);
+                destination[0].Item3 += TensorPrimitives.SumOfSquares(y);
+            }
+        }
+
+        public readonly struct CosPi<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.CosPi(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.CosPi(x, destination);
+            }
+        }
+
+        public readonly struct Decrement<T>
+            : IUnaryOperation_Tensor<T, T>
+            where T : IDecrementOperators<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                T tmp = x;
+                destination = --tmp;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Decrement(x, destination);
+            }
+        }
+
+        public readonly struct DegreesToRadians<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.DegreesToRadians(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.DegreesToRadians(x, destination);
+            }
+        }
+
+        public readonly struct Divide<T>
+            : IBinaryOperation_Scalar_Tensor<T, T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IDivisionOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x / y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Divide(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x / y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Divide(x, y, destination);
+            }
+
+            public static void Invoke(T x, ref readonly T y, ref T destination)
+            {
+                destination = x / y;
+            }
+            public static void Invoke(T x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Divide(x, y, destination);
+            }
+        }
+
+        public struct Dot<T>
+            : IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IAdditionOperators<T, T, T>, IAdditiveIdentity<T, T>, IMultiplicativeIdentity<T, T>, IMultiplyOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination += x * y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                destination[0] += TensorPrimitives.Dot(x, y);
+            }
+        }
+
+        public readonly struct Exp<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Exp(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Exp(x, destination);
+            }
+        }
+
+        public readonly struct Exp10<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Exp10(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Exp10(x, destination);
+            }
+        }
+
+        public readonly struct Exp10M1<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Exp10M1(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Exp10M1(x, destination);
+            }
+        }
+
+        public readonly struct Exp2<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Exp2(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Exp2(x, destination);
+            }
+        }
+
+        public readonly struct Exp2M1<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Exp2M1(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Exp2M1(x, destination);
+            }
+        }
+
+        public readonly struct ExpM1<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.ExpM1(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.ExpM1(x, destination);
+            }
+        }
+
+        public readonly struct Floor<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IFloatingPoint<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Floor(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Floor(x, destination);
+            }
+        }
+
+        public readonly struct Hypot<T>
+            : IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IRootFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Hypot(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Hypot(x, y, destination);
+            }
+        }
+
+        public readonly struct Ieee754Remainder<T>
+            : IBinaryOperation_Scalar_Tensor<T, T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IFloatingPointIeee754<T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Ieee754Remainder(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Ieee754Remainder(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Ieee754Remainder(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Ieee754Remainder(x, y, destination);
+            }
+
+            public static void Invoke(T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Ieee754Remainder(x, y);
+            }
+            public static void Invoke(T x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Ieee754Remainder(x, y, destination);
+            }
+        }
+
+        public readonly struct ILogB<T>
+        : IUnaryOperation_Tensor<T, int>
+        where T : IFloatingPointIeee754<T>
+        {
+            public static void Invoke(ref readonly T x, ref int destination)
+            {
+                destination = T.ILogB(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<int> destination)
+            {
+                TensorPrimitives.ILogB(x, destination);
+            }
+        }
+
+        public readonly struct Increment<T>
+            : IUnaryOperation_Tensor<T, T>
+            where T : IIncrementOperators<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                T tmp = x;
+                destination = ++tmp;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Increment(x, destination);
+            }
+        }
+
+        public readonly struct LeadingZeroCount<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IBinaryInteger<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.LeadingZeroCount(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.LeadingZeroCount(x, destination);
+            }
+        }
+
+        public readonly struct Log<T>
+        : IUnaryOperation_Tensor<T, T>,
+          IBinaryOperation_Tensor_Tensor<T, T>,
+          IBinaryOperation_Tensor_Scalar<T, T>
+        where T : ILogarithmicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Log(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Log(x, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Log(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Log(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Log(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Log(x, y, destination);
+            }
+        }
+
+        public readonly struct Log10<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ILogarithmicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Log10(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Log10(x, destination);
+            }
+        }
+
+        public readonly struct Log10P1<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ILogarithmicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Log10P1(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Log10P1(x, destination);
+            }
+        }
+
+        public readonly struct Log2<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ILogarithmicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Log2(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Log2(x, destination);
+            }
+        }
+
+        public readonly struct Log2P1<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ILogarithmicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Log2P1(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Log2P1(x, destination);
+            }
+        }
+
+        public readonly struct LogP1<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ILogarithmicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.LogP1(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.LogP1(x, destination);
+            }
+        }
+
+        public struct Max<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Max(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.Max(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Max(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Max(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Max(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Max(x, y, destination);
+            }
+        }
+
+        public struct MaxMagnitude<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.MaxMagnitude(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.MaxMagnitude(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.MaxMagnitude(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.MaxMagnitude(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.MaxMagnitude(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.MaxMagnitude(x, y, destination);
+            }
+        }
+
+        public struct MaxMagnitudeNumber<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumberBase<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.MaxMagnitudeNumber(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.MaxMagnitudeNumber(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.MaxMagnitudeNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.MaxMagnitudeNumber(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.MaxMagnitudeNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.MaxMagnitudeNumber(x, y, destination);
+            }
+        }
+
+        public struct MaxNumber<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.MaxNumber(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.MaxNumber(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.MaxNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.MaxNumber(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.MaxNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.MaxNumber(x, y, destination);
+            }
+        }
+
+        public struct Min<T>
+        : IUnaryReduction_Tensor<T, T>,
+          IBinaryOperation_Tensor_Scalar<T, T>,
+          IBinaryOperation_Tensor_Tensor<T, T>
+        where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Min(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.Min(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Min(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Min(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Min(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Min(x, y, destination);
+            }
+        }
+
+        public struct MinMagnitude<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.MinMagnitude(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.MinMagnitude(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.MinMagnitude(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.MinMagnitude(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.MinMagnitude(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.MinMagnitude(x, y, destination);
+            }
+        }
+
+        public struct MinMagnitudeNumber<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumberBase<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.MinMagnitudeNumber(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.MinMagnitudeNumber(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.MinMagnitudeNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.MinMagnitudeNumber(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.MinMagnitudeNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.MinMagnitudeNumber(x, y, destination);
+            }
+        }
+
+        public struct MinNumber<T>
+            : IUnaryReduction_Tensor<T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : INumber<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.MinNumber(x, destination);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.MinNumber(x);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.MinNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.MinNumber(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.MinNumber(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.MinNumber(x, y, destination);
+            }
+        }
+
+        public readonly struct Multiply<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IMultiplyOperators<T, T, T>, IMultiplicativeIdentity<T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x * y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Multiply(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x * y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Multiply(x, y, destination);
+            }
+        }
+
+        public readonly struct Negate<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IUnaryNegationOperators<T, T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = -x;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Negate(x, destination);
+            }
+        }
+
+        public readonly struct OnesComplement<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IBitwiseOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = ~x;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.OnesComplement(x, destination);
+            }
+        }
+
+        public readonly struct PopCount<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IBinaryInteger<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.PopCount(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.PopCount(x, destination);
+            }
+        }
+
+        public readonly struct Pow<T>
+            : IBinaryOperation_Scalar_Tensor<T, T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IPowerFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = T.Pow(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Pow(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Pow(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Pow(x, y, destination);
+            }
+
+            public static void Invoke(T x, ref readonly T y, ref T destination)
+            {
+                destination = T.Pow(x, y);
+            }
+
+            public static void Invoke(T x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Pow(x, y, destination);
+            }
+        }
+
+        public struct Product<T>
+            : IUnaryReduction_Tensor<T, T>
+            where T : IMultiplicativeIdentity<T, T>, IMultiplyOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination *= x;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination = TensorPrimitives.Product(x);
+            }
+        }
+
+        public readonly struct RadiansToDegrees<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.RadiansToDegrees(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.RadiansToDegrees(x, destination);
+            }
+        }
+
+        public readonly struct Reciprocal<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IFloatingPoint<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.One / x;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Reciprocal(x, destination);
+            }
+        }
+
+        public readonly struct RootN<T>
+        : IBinaryOperation_Tensor_Int32<T, T>
+        where T : IRootFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, int y, ref T destination)
+            {
+                destination = T.RootN(x, y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, int y, Span<T> destination)
+            {
+                TensorPrimitives.RootN(x, y, destination);
+            }
+        }
+
+        public readonly struct RotateLeft<T>
+        : IBinaryOperation_Tensor_Int32<T, T>
+        where T : IBinaryInteger<T>
+        {
+            public static void Invoke(ref readonly T x, int y, ref T destination)
+            {
+                destination = T.RotateLeft(x, y);
+            }
+            public static void Invoke(ReadOnlySpan<T> x, int y, Span<T> destination)
+            {
+                TensorPrimitives.RotateLeft(x, y, destination);
+            }
+        }
+
+        public readonly struct RotateRight<T>
+        : IBinaryOperation_Tensor_Int32<T, T>
+        where T : IBinaryInteger<T>
+        {
+            public static void Invoke(ref readonly T x, int y, ref T destination)
+            {
+                destination = T.RotateRight(x, y);
+            }
+            public static void Invoke(ReadOnlySpan<T> x, int y, Span<T> destination)
+            {
+                TensorPrimitives.RotateRight(x, y, destination);
+            }
+        }
+
+        public readonly struct Round<T>
+        : IUnaryOperation_Tensor<T, T>,
+          IBinaryOperation_Tensor_Scalar<T, Tuple<int, MidpointRounding>, T>
+        where T : IFloatingPoint<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Round(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Round(x, destination);
+            }
+
+            public static void Invoke(ref readonly T x, Tuple<int, MidpointRounding> y, ref T destination)
+            {
+                destination = T.Round(x, y.Item1, y.Item2);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Tuple<int, MidpointRounding> y, Span<T> destination)
+            {
+                TensorPrimitives.Round(x, y.Item1, y.Item2, destination);
+            }
+        }
+
+        public readonly struct ShiftLeft<T>
+            : IBinaryOperation_Tensor_Scalar<T, int, T>
+            where T : IShiftOperators<T, int, T>
+        {
+            public static void Invoke(ref readonly T x, int shiftAmount, ref T destination)
+            {
+                destination = x << shiftAmount;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, int shiftAmount, Span<T> destination)
+            {
+                TensorPrimitives.ShiftLeft(x, shiftAmount, destination);
+            }
+        }
+
+        public readonly struct ShiftRightArithmetic<T>
+            : IBinaryOperation_Tensor_Scalar<T, int, T>
+            where T : IShiftOperators<T, int, T>
+        {
+            public static void Invoke(ref readonly T x, int shiftAmount, ref T destination)
+            {
+                destination = x >> shiftAmount;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, int shiftAmount, Span<T> destination)
+            {
+                TensorPrimitives.ShiftRightArithmetic(x, shiftAmount, destination);
+            }
+        }
+
+        public readonly struct ShiftRightLogical<T>
+            : IBinaryOperation_Tensor_Scalar<T, int, T>
+            where T : IShiftOperators<T, int, T>
+        {
+            public static void Invoke(ref readonly T x, int shiftAmount, ref T destination)
+            {
+                destination = x >>> shiftAmount;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, int shiftAmount, Span<T> destination)
+            {
+                TensorPrimitives.ShiftRightLogical(x, shiftAmount, destination);
+            }
+        }
+
+        public readonly struct Sigmoid<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.One / (T.One + T.Exp(-x));
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Sigmoid(x, destination);
+            }
+        }
+
+        public readonly struct Sin<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Sin(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Sin(x, destination);
+            }
+        }
+
+        public readonly struct Sinh<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IHyperbolicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Sinh(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Sinh(x, destination);
+            }
+        }
+
+        public readonly struct SinPi<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.SinPi(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.SinPi(x, destination);
+            }
+        }
+
+        // SoftMax Helper
+        public readonly struct SumExp<T>
+        : IUnaryReduction_Tensor<T, (T Shift, T Sum, bool HasValue)>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref (T Shift, T Sum, bool HasValue) destination)
+            {
+                if (!destination.HasValue)
+                {
+                    destination = (x, T.One, true);
+                    return;
+                }
+
+                if (T.IsNegativeInfinity(x))
+                {
+                    return;
+                }
+
+                T term = T.Exp(x - destination.Shift);
+                if (T.IsInfinity(term))
+                {
+                    destination.Sum = (destination.Sum * T.Exp(destination.Shift - x)) + T.One;
+                    destination.Shift = x;
+                }
+                else if (T.IsInfinity(destination.Sum + term))
+                {
+                    T previousShift = destination.Shift;
+                    T step = T.One;
+                    T nextShift = previousShift + step;
+                    while (nextShift.Equals(previousShift))
+                    {
+                        step += step;
+                        nextShift = previousShift + step;
+                    }
+                    T scale = T.Exp(previousShift - nextShift);
+                    destination.Shift = nextShift;
+                    destination.Sum = (destination.Sum * scale) + (term * scale);
+                }
+                else
+                {
+                    destination.Sum += term;
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref (T Shift, T Sum, bool HasValue) destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    Invoke(in x[i], ref destination);
+                }
+            }
+        }
+
+        public readonly struct SoftMax<T>
+        : IBinaryOperation_Tensor_Scalar<T, (T Shift, T Sum), T>
+        where T : IExponentialFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, (T Shift, T Sum) y, ref T destination)
+            {
+                destination = T.Exp(x - y.Shift) / y.Sum;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, (T Shift, T Sum) y, Span<T> destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    destination[i] = T.Exp(x[i] - y.Shift) / y.Sum;
+                }
+            }
+        }
+
+        public readonly struct Sqrt<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IRootFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Sqrt(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Sqrt(x, destination);
+            }
+        }
+
+        public readonly struct Subtract<T>
+            : IBinaryOperation_Scalar_Tensor<T, T, T>,
+              IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : ISubtractionOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x - y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Subtract(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x - y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Subtract(x, y, destination);
+            }
+
+            public static void Invoke(T x, ref readonly T y, ref T destination)
+            {
+                destination = x - y;
+            }
+
+            public static void Invoke(T x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Subtract(x, y, destination);
+            }
+        }
+
+        public struct Sum<T>
+            : IUnaryReduction_Tensor<T, T>
+            where T : IAdditionOperators<T, T, T>, IAdditiveIdentity<T, T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination += x;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination += TensorPrimitives.Sum(x);
+            }
+        }
+
+        public struct SumOfSquaredDifferences<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IAdditionOperators<T, T, T>, IAdditiveIdentity<T, T>, IMultiplyOperators<T, T, T>, ISubtractionOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination += (x - y) * (x - y);
+            }
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    destination[i] = (x[i] - y) * (x[i] - y);
+                }
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination += (x - y) * (x - y);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    destination[i] = (x[i] - y[i]) * (x[i] - y[i]);
+                }
+            }
+        }
+
+        public readonly struct SumOfSquaredAbsoluteDifferences<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>
+            where T : IAdditionOperators<T, T, T>, IAdditiveIdentity<T, T>, IMultiplyOperators<T, T, T>, ISubtractionOperators<T, T, T>, INumberBase<T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                // Absolute value is needed before squaring to support complex numbers
+                T diff = T.Abs(x - y);
+                destination += diff * diff;
+            }
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    // Absolute value is needed before squaring to support complex numbers
+                    T diff = T.Abs(x[i] - y);
+                    destination[i] = diff * diff;
+                }
+            }
+        }
+
+        public readonly struct SumOfSquares<T>
+        : IUnaryReduction_Tensor<T, T>
+        where T : IAdditionOperators<T, T, T>, IAdditiveIdentity<T, T>, IMultiplyOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination += x * x;
+            }
+            public static void Invoke(ReadOnlySpan<T> x, ref T destination)
+            {
+                destination += TensorPrimitives.SumOfSquares(x);
+            }
+        }
+
+        public readonly struct Tan<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Tan(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Tan(x, destination);
+            }
+        }
+
+        public readonly struct Tanh<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IHyperbolicFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Tanh(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Tanh(x, destination);
+            }
+        }
+
+        public readonly struct TanPi<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : ITrigonometricFunctions<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.TanPi(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.TanPi(x, destination);
+            }
+        }
+
+        public readonly struct TrailingZeroCount<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IBinaryInteger<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.TrailingZeroCount(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.TrailingZeroCount(x, destination);
+            }
+        }
+
+        public readonly struct Truncate<T>
+        : IUnaryOperation_Tensor<T, T>
+        where T : IFloatingPoint<T>
+        {
+            public static void Invoke(ref readonly T x, ref T destination)
+            {
+                destination = T.Truncate(x);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, Span<T> destination)
+            {
+                TensorPrimitives.Truncate(x, destination);
+            }
+        }
+
+        public readonly struct Xor<T>
+            : IBinaryOperation_Tensor_Scalar<T, T>,
+              IBinaryOperation_Tensor_Tensor<T, T>
+            where T : IBitwiseOperators<T, T, T>
+        {
+            public static void Invoke(ref readonly T x, T y, ref T destination)
+            {
+                destination = x ^ y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, T y, Span<T> destination)
+            {
+                TensorPrimitives.Xor(x, y, destination);
+            }
+
+            public static void Invoke(ref readonly T x, ref readonly T y, ref T destination)
+            {
+                destination = x ^ y;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                TensorPrimitives.Xor(x, y, destination);
+            }
+        }
+
+        #endregion
+
+        public readonly struct Fill<T>
+            : IUnaryOperation_Scalar<T, T>
+        {
+            public static void Invoke(ref T destination, T value)
+            {
+                destination = value;
+            }
+
+            public static void Invoke(Span<T> destination, T value)
+            {
+                destination.Fill(value);
+            }
+        }
+
+        public readonly struct FilteredUpdate<T>
+            : IBinaryOperation_Tensor_Scalar<bool, T, T>,
+              IBinaryOperation_Tensor_Tensor<bool, T, T>
+        {
+            public static void Invoke(ref readonly bool x, ref readonly T y, ref T destination)
+            {
+                if (x)
+                {
+                    destination = y;
+                }
+            }
+            public static void Invoke(ReadOnlySpan<bool> x, ReadOnlySpan<T> y, Span<T> destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    if (x[i])
+                    {
+                        destination[i] = y[i];
+                    }
+                }
+            }
+
+            public static void Invoke(ref readonly bool x, T y, ref T destination)
+            {
+                if (x)
+                {
+                    destination = y;
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<bool> x, T y, Span<T> destination)
+            {
+                for (int i = 0; i < x.Length; i++)
+                {
+                    if (x[i])
+                    {
+                        destination[i] = y;
+                    }
+                }
+            }
+        }
+
+        public readonly struct GreaterThan<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = (left > right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = (left > right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] > right);
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] > right[i]);
+                }
+            }
+        }
+
+        public readonly struct GreaterThanAny<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            // The main loop early exits at the first false condition, so we
+            // check !(x > y) and returns false on first not greater. The consumer will
+            // then negate whatever the main loop returns as `true` means none
+            // are greater.
+
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = !(left > right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = !(left > right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] > right);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] > right[i]);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+        }
+
+        public readonly struct GreaterThanOrEqual<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = (left >= right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = (left >= right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] >= right);
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] >= right[i]);
+                }
+            }
+        }
+
+        public readonly struct GreaterThanOrEqualAny<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            // The main loop early exits at the first false condition, so we
+            // check !(x >= y) and returns false on first not greater or equal.
+            // The consumer will then negate whatever the main loop returns as
+            // `true` means none are greater or equal.
+
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = !(left >= right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = !(left >= right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] >= right);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] >= right[i]);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+        }
+
+        public readonly struct LessThan<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = (left < right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = (left < right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] < right);
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] < right[i]);
+                }
+            }
+        }
+
+        public readonly struct LessThanAny<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            // The main loop early exits at the first false condition, so we
+            // check !(x < y) and returns false on first not lesser. The consumer will
+            // then negate whatever the main loop returns as `true` means none
+            // are lesser.
+
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = !(left < right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = !(left < right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] < right);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] < right[i]);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+        }
+
+        public readonly struct LessThanOrEqual<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = (left <= right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = (left <= right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] <= right);
+                }
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = (left[i] <= right[i]);
+                }
+            }
+        }
+
+        public readonly struct LessThanOrEqualAny<T>
+            : IBinaryOperation_Tensor_Scalar<T, bool>,
+              IBinaryOperation_Tensor_Tensor<T, bool>
+            where T : IComparisonOperators<T, T, bool>
+        {
+            // The main loop early exits at the first false condition, so we
+            // check !(x <= y) and returns false on first not lesser or equal.
+            // The consumer will then negate whatever the main loop returns as
+            // `true` means none are lesser or equal.
+
+            public static void Invoke(ref readonly T left, T right, ref bool destination)
+            {
+                destination = !(left <= right);
+            }
+
+            public static void Invoke(ref readonly T left, ref readonly T right, ref bool destination)
+            {
+                destination = !(left <= right);
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, T right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] <= right);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+
+            public static void Invoke(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Span<bool> destination)
+            {
+                Debug.Assert(destination.Length == 1);
+                bool result = true;
+
+                for (int i = 0; i < left.Length; i++)
+                {
+                    result = !(left[i] <= right[i]);
+
+                    if (!result)
+                    {
+                        break;
+                    }
+                }
+
+                destination[0] = result;
+            }
+        }
+
+        public interface IBinaryOperation_Tensor_Scalar<T, TResult>
+            : IBinaryOperation_Tensor_Scalar<T, T, TResult>
+        {
+        }
+
+        public interface IBinaryOperation_Tensor_Int32<T, TResult>
+            : IBinaryOperation_Tensor_Scalar<T, int, TResult>
+        {
+        }
+
+        public interface IBinaryOperation_Tensor_Scalar<T1, T2, TResult>
+        {
+            static abstract void Invoke(ref readonly T1 x, T2 y, ref TResult destination);
+            static abstract void Invoke(ReadOnlySpan<T1> x, T2 y, Span<TResult> destination);
+        }
+
+        public interface IBinaryOperation_Scalar_Tensor<T1, T2, TResult>
+        {
+            static abstract void Invoke(T1 x, ref readonly T2 y, ref TResult destination);
+            static abstract void Invoke(T1 x, ReadOnlySpan<T2> y, Span<TResult> destination);
+        }
+
+        public interface IBinaryOperation_Tensor_Tensor<T1, T2, TResult>
+        {
+            static abstract void Invoke(ref readonly T1 x, ref readonly T2 y, ref TResult destination);
+            static abstract void Invoke(ReadOnlySpan<T1> x, ReadOnlySpan<T2> y, Span<TResult> destination);
+        }
+
+        public interface IBinaryOperation_Tensor_Tensor<T, TResult>
+            : IBinaryOperation_Tensor_Tensor<T, T, TResult>
+        {
+        }
+
+        public interface IOperation<T>
+        {
+            static abstract void Invoke(ref T destination);
+            static abstract void Invoke(Span<T> destination);
+        }
+
+        public interface IUnaryOperation_Scalar<T, TResult>
+        {
+            static abstract void Invoke(ref TResult destination, T x);
+            static abstract void Invoke(Span<TResult> destination, T x);
+        }
+
+        public interface IUnaryOperation_Tensor<T, TResult>
+        {
+            static abstract void Invoke(ref readonly T x, ref TResult destination);
+            static abstract void Invoke(ReadOnlySpan<T> x, Span<TResult> destination);
+        }
+
+        public interface IUnaryReduction_Tensor<T, TResult>
+        {
+            static abstract void Invoke(ref readonly T x, ref TResult destination);
+            static abstract void Invoke(ReadOnlySpan<T> x, ref TResult destination);
+        }
+
+        internal readonly struct RentedBuffer
+        {
+            public static Span<T> Create<T>(int rank, ReadOnlySpan<nint> strides, out nint linearOffset, [UnscopedRef] out RentedBuffer<T> rentedBuffer)
+                where T : INumber<T>
+            {
+                Span<T> output = RentedBuffer<T>.Create(rank, out rentedBuffer);
+                linearOffset = 0 - (!strides.IsEmpty ? strides[^1] : 0);
+
+                if (!output.IsEmpty)
+                {
+                    output[^1] = T.CreateChecked(-1);
+                }
+                return output;
+            }
+
+            public static Span<T> CreateUninitialized<T>(int rank, [UnscopedRef] out RentedBuffer<T> rentedBuffer)
+                => RentedBuffer<T>.Create(rank, out rentedBuffer);
+        }
+
+        internal ref struct RentedBuffer<T> : IDisposable
+        {
+            private T[]? _array;
+            private TensorShape.InlineBuffer<T> _inline;
+
+            public static Span<T> Create(int rank, [UnscopedRef] out RentedBuffer<T> rentedBuffer)
+            {
+                if (rank > TensorShape.MaxInlineRank)
+                {
+                    rentedBuffer._array = ArrayPool<T>.Shared.Rent(rank);
+                    Unsafe.SkipInit(out rentedBuffer._inline);
+
+                    Span<T> resultBuffer = rentedBuffer._array.AsSpan(0, rank);
+                    resultBuffer.Clear();
+                    return resultBuffer;
+                }
+                else
+                {
+                    rentedBuffer._array = null;
+                    rentedBuffer._inline = default;
+
+                    return ((Span<T>)rentedBuffer._inline)[..rank];
+                }
+            }
+
+            public void Dispose()
+            {
+                if (_array is not null)
+                {
+                    ArrayPool<T>.Shared.Return(_array);
+                    _array = null;
+                }
+            }
+        }
+    }
+}

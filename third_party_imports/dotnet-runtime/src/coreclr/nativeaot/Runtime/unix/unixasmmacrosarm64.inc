@@ -1,0 +1,163 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+#include "AsmOffsets.inc"
+
+#include <arm64/AsmMacros_Unix.inc>
+
+// Inlined version of RhpGetThread. Target cannot be x0.
+// Preserves all other general-purpose registers, except x16 and x17 on Apple.
+// Can trash volatile FP/SIMD registers.
+// Only for functions whose CFA is sp-based (no fp frame): the x0/lr save adjusts the CFA offset.
+.macro INLINE_GETTHREAD target
+    PROLOG_SAVE_REG_PAIR_INDEXED      x0, lr, -0x10
+    INLINE_GET_TLS_VAR \target, C_FUNC(tls_CurrentThread)
+    EPILOG_RESTORE_REG_PAIR_INDEXED   x0, lr, 0x10
+.endm
+
+// Target cannot be x0 or x2. Preserves x0-x2, which the allocation helpers keep live across it.
+// Only for functions whose CFA is sp-based (no fp frame), see INLINE_GETTHREAD.
+.macro INLINE_GET_ALLOC_CONTEXT_BASE target
+    .ifc \target, x0
+        .error "target cannot be x0"
+    .endif
+    .ifc \target, x2
+        .error "target cannot be x2"
+    .endif
+
+#ifdef FEATURE_EMULATED_TLS
+    PROLOG_SAVE_REG_PAIR_INDEXED      fp, lr, -0x30
+    PROLOG_SAVE_REG_PAIR              x0, x1, 0x10
+    PROLOG_SAVE_REG                   x2, 0x20
+
+    bl C_FUNC(RhpGetThread)
+    mov         \target, x0
+
+    EPILOG_RESTORE_REG                x2, 0x20
+    .ifc \target, x1
+    EPILOG_RESTORE_REG_PAIR           x0, xzr, 0x10
+    .else
+    EPILOG_RESTORE_REG_PAIR           x0, x1, 0x10
+    .endif
+    EPILOG_RESTORE_REG_PAIR_INDEXED   fp, lr, 0x30
+#else
+    INLINE_GETTHREAD \target
+#endif
+.endm
+
+
+// Do not use these ETLS macros in functions that already create a stack frame.
+// Creating two stack frames in one function can confuse the unwinder/debugger
+
+.macro GETTHREAD_ETLS_1
+    PROLOG_SAVE_REG_PAIR_INDEXED   fp, lr, -32           // ;; Push down stack pointer and store FP and LR
+    str         x0,  [sp, #0x10]
+
+    bl C_FUNC(RhpGetThread)
+    mov x1, x0
+
+    ldr         x0,  [sp, #0x10]
+    EPILOG_RESTORE_REG_PAIR_INDEXED   fp, lr, 32
+.endm
+
+.macro GETTHREAD_ETLS_2
+    PROLOG_SAVE_REG_PAIR_INDEXED   fp, lr, -32           // ;; Push down stack pointer and store FP and LR
+    stp         x0, x1, [sp, #0x10]
+
+    bl C_FUNC(RhpGetThread)
+    mov x2, x0
+
+    ldp         x0, x1, [sp, #0x10]
+    EPILOG_RESTORE_REG_PAIR_INDEXED   fp, lr, 32
+.endm
+
+.macro GETTHREAD_ETLS_3
+    PROLOG_SAVE_REG_PAIR_INDEXED   fp, lr, -48           // ;; Push down stack pointer and store FP and LR
+    stp         x0, x1, [sp, #0x10]
+    str         x2,  [sp, #0x20]
+
+    bl C_FUNC(RhpGetThread)
+    mov x3, x0
+
+    ldp         x0, x1, [sp, #0x10]
+    ldr         x2,  [sp, #0x20]
+    EPILOG_RESTORE_REG_PAIR_INDEXED   fp, lr, 48
+.endm
+
+.macro INLINE_THREAD_UNHIJACK threadReg, trashReg1, trashReg2
+    //
+    // Thread::Unhijack()
+    //
+    ldr         \trashReg1, [\threadReg, #OFFSETOF__Thread__m_pvHijackedReturnAddress]
+    cbz         \trashReg1, 0f
+
+    ldr         \trashReg2, [\threadReg, #OFFSETOF__Thread__m_ppvHijackedReturnAddressLocation]
+    str         \trashReg1, [\trashReg2]
+    str         xzr, [\threadReg, #OFFSETOF__Thread__m_ppvHijackedReturnAddressLocation]
+    str         xzr, [\threadReg, #OFFSETOF__Thread__m_pvHijackedReturnAddress]
+    str         xzr, [\threadReg, #OFFSETOF__Thread__m_pSpForPacSign]
+0:
+.endm
+
+// Note: these must match the defs in PInvokeTransitionFrameFlags
+#define PTFF_SAVE_SP            0x00000400
+#define PTFF_SAVE_X0            0x00000800
+#define PTFF_SAVE_X1            0x00001000
+#define PTFF_SAVE_X2            0x00002000
+#define PTFF_SAVE_X3            0x00004000
+#define PTFF_SAVE_X4            0x00008000
+#define PTFF_SAVE_X5            0x00010000
+#define PTFF_SAVE_X6            0x00020000
+#define PTFF_SAVE_X7            0x00040000
+#define PTFF_SAVE_ALL_PRESERVED 0x000003FF  // NOTE: x19-x28
+#define PTFF_THREAD_HIJACK_HI   0x00000001  // upper 32 bits of the PTFF_THREAD_HIJACK
+
+#define DEFAULT_FRAME_SAVE_FLAGS (PTFF_SAVE_ALL_PRESERVED + PTFF_SAVE_SP)
+
+.macro PUSH_COOP_PINVOKE_FRAME trashReg
+
+    PROLOG_SAVE_REG_PAIR_INDEXED   fp, lr, -0x80      // Push down stack pointer and store FP and LR
+
+    // 0x10 bytes reserved for Thread* and flags
+
+    // Save callee saved registers
+    PROLOG_SAVE_REG_PAIR   x19, x20, 0x20
+    PROLOG_SAVE_REG_PAIR   x21, x22, 0x30
+    PROLOG_SAVE_REG_PAIR   x23, x24, 0x40
+    PROLOG_SAVE_REG_PAIR   x25, x26, 0x50
+    PROLOG_SAVE_REG_PAIR   x27, x28, 0x60
+
+    // Save the value of SP before stack allocation to the last slot in the frame (slot #15)
+    add                    \trashReg, sp, #0x80
+    str                    \trashReg, [sp, #0x70]
+
+    // Record the bitmask of saved registers in the frame (slot #3)
+    mov                    \trashReg, #DEFAULT_FRAME_SAVE_FLAGS
+    str                    \trashReg, [sp, #0x18]
+
+    mov  \trashReg, sp
+.endm
+
+// Pop the frame and restore register state preserved by PUSH_COOP_PINVOKE_FRAME
+.macro POP_COOP_PINVOKE_FRAME
+
+    EPILOG_RESTORE_REG_PAIR   x19, x20, 0x20
+    EPILOG_RESTORE_REG_PAIR   x21, x22, 0x30
+    EPILOG_RESTORE_REG_PAIR   x23, x24, 0x40
+    EPILOG_RESTORE_REG_PAIR   x25, x26, 0x50
+    EPILOG_RESTORE_REG_PAIR   x27, x28, 0x60
+    EPILOG_RESTORE_REG_PAIR_INDEXED   fp, lr, 0x80
+.endm
+
+//
+// CONSTANTS -- INTEGER
+//
+#define TSF_Attached                    0x01
+#define TSF_DoNotTriggerGc              0x10
+
+// Bit position for the flags above, to be used with tbz / tbnz instructions
+#define TrapThreadsFlags_TrapThreads_Bit     0
+
+// These must match the TrapThreadsFlags enum
+#define TrapThreadsFlags_None            0
+#define TrapThreadsFlags_TrapThreads     1

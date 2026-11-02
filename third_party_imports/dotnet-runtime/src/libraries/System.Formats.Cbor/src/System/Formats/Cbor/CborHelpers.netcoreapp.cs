@@ -1,0 +1,22 @@
+﻿// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Buffers.Binary;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+
+namespace System.Formats.Cbor
+{
+    internal static partial class CborHelpers
+    {
+        public static BigInteger CreateBigIntegerFromUnsignedBigEndianBytes(byte[] bytes)
+            => new BigInteger(bytes, isUnsigned: true, isBigEndian: true);
+
+        public static byte[] CreateUnsignedBigEndianBytesFromBigInteger(BigInteger value)
+            => value.ToByteArray(isUnsigned: true, isBigEndian: true);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Half ReadHalfBigEndian(ReadOnlySpan<byte> source)
+            => BinaryPrimitives.ReadHalfBigEndian(source);
+    }
+}

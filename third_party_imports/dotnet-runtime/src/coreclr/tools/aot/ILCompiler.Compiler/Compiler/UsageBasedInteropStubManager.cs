@@ -1,0 +1,94 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System;
+
+using Internal.IL;
+using Internal.TypeSystem;
+using Internal.TypeSystem.Interop;
+using ILCompiler.DependencyAnalysis;
+
+using Debug = System.Diagnostics.Debug;
+using DependencyList = ILCompiler.DependencyAnalysisFramework.DependencyNodeCore<ILCompiler.DependencyAnalysis.NodeFactory>.DependencyList;
+using DependencySink = ILCompiler.DependencyAnalysisFramework.DependencyNodeCore<ILCompiler.DependencyAnalysis.NodeFactory>.DependencySink;
+using IDependencySink = ILCompiler.DependencyAnalysisFramework.DependencyNodeCore<ILCompiler.DependencyAnalysis.NodeFactory>.IDependencySink;
+using ILCompiler.DependencyAnalysisFramework;
+
+namespace ILCompiler
+{
+    /// <summary>
+    /// Represents an interop stub manager whose list of stubs is determined by statical usage seen in the compiled program.
+    /// </summary>
+    public class UsageBasedInteropStubManager : CompilerGeneratedInteropStubManager
+    {
+        private Logger _logger;
+
+        public UsageBasedInteropStubManager(InteropStateManager interopStateManager, PInvokeILEmitterConfiguration pInvokeILEmitterConfiguration, Logger logger)
+            : base(interopStateManager, pInvokeILEmitterConfiguration)
+        {
+            _logger = logger;
+        }
+
+        public override void AddDependenciesDueToMethodCodePresence(IDependencySink dependencies, NodeFactory factory, MethodDesc method)
+        {
+            if (method.HasInstantiation)
+            {
+                AddMarshalAPIsGenericDependencies(dependencies, factory, method);
+            }
+        }
+
+        public override void AddInterestingInteropConstructedTypeDependencies(DependencySink dependencies, NodeFactory factory, TypeDesc type)
+        {
+            if (type.IsDelegate)
+            {
+                var delegateType = (MetadataType)type;
+                if (delegateType.HasCustomAttribute("System.Runtime.InteropServices", "UnmanagedFunctionPointerAttribute"))
+                {
+                    dependencies.Add(factory.DelegateMarshallingData(delegateType), "Delegate marshalling");
+                }
+            }
+        }
+
+        /// <summary>
+        /// For Marshal generic APIs(eg. Marshal.StructureToPtr<T>, GetFunctionPointerForDelegate) we add
+        /// the generic parameter as dependencies so that we can generate runtime data for them
+        /// </summary>
+        public override void AddMarshalAPIsGenericDependencies(IDependencySink dependencies, NodeFactory factory, MethodDesc method)
+        {
+            Debug.Assert(method.HasInstantiation);
+
+            TypeDesc owningType = method.OwningType;
+            MetadataType metadataType = owningType as MetadataType;
+            if (metadataType != null && metadataType.Module == factory.TypeSystemContext.SystemModule)
+            {
+                if (metadataType.Name == "Marshal"u8 && metadataType.Namespace == "System.Runtime.InteropServices"u8)
+                {
+                    string methodName = method.GetName();
+                    if (methodName == "GetFunctionPointerForDelegate" ||
+                        methodName == "GetDelegateForFunctionPointer" ||
+                        methodName == "PtrToStructure" ||
+                        methodName == "StructureToPtr" ||
+                        methodName == "SizeOf" ||
+                        methodName == "OffsetOf")
+                    {
+                        foreach (TypeDesc type in method.Instantiation)
+                        {
+                            if (type.IsDelegate)
+                            {
+                                dependencies.Add(factory.DelegateMarshallingData((DefType)type), "Delegate marshlling");
+                            }
+                            else if (type.IsCanonicalSubtype(CanonicalFormKind.Any))
+                            {
+                                // Nothing to do
+                            }
+                            else if (type is DefType defType)
+                            {
+                                dependencies.Add(factory.StructMarshallingData(defType), "Struct marshalling");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

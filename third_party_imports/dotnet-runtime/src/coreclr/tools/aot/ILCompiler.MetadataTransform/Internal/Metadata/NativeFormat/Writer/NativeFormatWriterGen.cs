@@ -1,0 +1,2841 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+// NOTE: This is a generated file - do not manually edit!
+
+#pragma warning disable 649, SA1121, IDE0036, SA1129
+
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Threading;
+using Internal.LowLevelLinq;
+using Internal.Metadata.NativeFormat.Writer;
+using Internal.NativeFormat;
+using HandleType = Internal.Metadata.NativeFormat.HandleType;
+using Debug = System.Diagnostics.Debug;
+
+namespace Internal.Metadata.NativeFormat.Writer
+{
+    public partial class ArraySignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ArraySignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            ElementType = visitor.Visit(this, ElementType);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ArraySignature;
+            if (other == null) return false;
+            if (!Object.Equals(ElementType, other.ElementType)) return false;
+            if (Rank != other.Rank) return false;
+            if (!Sizes.SequenceEqual(other.Sizes)) return false;
+            if (!LowerBounds.SequenceEqual(other.LowerBounds)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1450734452);
+            hash.Add(ElementType);
+            hash.Add(Rank);
+            for (int i = 0; i < Sizes.Length; i++)
+                hash.Add(Sizes[i]);
+            for (int i = 0; i < LowerBounds.Length; i++)
+                hash.Add(LowerBounds[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(ElementType == null ||
+                ElementType.HandleType == HandleType.TypeDefinition ||
+                ElementType.HandleType == HandleType.TypeReference ||
+                ElementType.HandleType == HandleType.TypeSpecification ||
+                ElementType.HandleType == HandleType.ModifiedType);
+            writer.Write(ElementType);
+            writer.Write(Rank);
+            writer.Write(Sizes);
+            writer.Write(LowerBounds);
+        } // Save
+
+        internal static ArraySignatureHandle AsHandle(ArraySignature record)
+        {
+            if (record == null)
+            {
+                return new ArraySignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ArraySignatureHandle Handle
+        {
+            get
+            {
+                return new ArraySignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord ElementType;
+        public int Rank;
+        public Int32[] Sizes;
+        public Int32[] LowerBounds;
+    } // ArraySignature
+
+    public partial class ByReferenceSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ByReferenceSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Type = visitor.Visit(this, Type);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ByReferenceSignature;
+            if (other == null) return false;
+            if (!Object.Equals(Type, other.Type)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-2085375797);
+            hash.Add(Type);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Type == null ||
+                Type.HandleType == HandleType.TypeDefinition ||
+                Type.HandleType == HandleType.TypeReference ||
+                Type.HandleType == HandleType.TypeSpecification ||
+                Type.HandleType == HandleType.ModifiedType);
+            writer.Write(Type);
+        } // Save
+
+        internal static ByReferenceSignatureHandle AsHandle(ByReferenceSignature record)
+        {
+            if (record == null)
+            {
+                return new ByReferenceSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ByReferenceSignatureHandle Handle
+        {
+            get
+            {
+                return new ByReferenceSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Type;
+    } // ByReferenceSignature
+
+    public partial class Constant : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.Constant;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Blob.Visit(this, visitor);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as Constant;
+            if (other == null) return false;
+            if (TypeCode != other.TypeCode) return false;
+            if (!Blob.Equals(other.Blob)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-464276854);
+            hash.Add(TypeCode);
+            hash.Add(Blob);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(TypeCode);
+            Blob.Save(writer);
+        } // Save
+
+        internal static ConstantHandle AsHandle(Constant record)
+        {
+            if (record == null)
+            {
+                return new ConstantHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ConstantHandle Handle
+        {
+            get
+            {
+                return new ConstantHandle(HandleOffset);
+            }
+        } // Handle
+
+        public ConstantTypeCode TypeCode;
+        public MetadataBlob Blob = new MetadataBlob();
+    } // Constant
+
+    public partial class ConstantStringArray : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ConstantStringArray;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Value = visitor.Visit(this, Value);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ConstantStringArray;
+            if (other == null) return false;
+            if (!Value.SequenceEqual(other.Value)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-106723178);
+            for (int i = 0; i < Value.Count; i++)
+                hash.Add(Value[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Value);
+        } // Save
+
+        internal static ConstantStringArrayHandle AsHandle(ConstantStringArray record)
+        {
+            if (record == null)
+            {
+                return new ConstantStringArrayHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ConstantStringArrayHandle Handle
+        {
+            get
+            {
+                return new ConstantStringArrayHandle(HandleOffset);
+            }
+        } // Handle
+
+        public List<ConstantStringValue> Value = new List<ConstantStringValue>();
+    } // ConstantStringArray
+
+    public partial class ConstantStringValue : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ConstantStringValue;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ConstantStringValue;
+            if (other == null) return false;
+            if (Value != other.Value) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(697695316);
+            hash.Add(Value);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            if (Value == null)
+                return;
+
+            writer.Write(Value);
+        } // Save
+
+        internal static ConstantStringValueHandle AsHandle(ConstantStringValue record)
+        {
+            if (record == null)
+            {
+                return new ConstantStringValueHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ConstantStringValueHandle Handle
+        {
+            get
+            {
+                if (Value == null)
+                    return new ConstantStringValueHandle(0);
+                else
+                    return new ConstantStringValueHandle(HandleOffset);
+            }
+        } // Handle
+
+        public string Value;
+    } // ConstantStringValue
+
+    public partial class CustomAttribute : MetadataRecord
+    {
+        public CustomAttribute()
+        {
+            _equalsReentrancyGuard = new ThreadLocal<ReentrancyGuardStack>(() => new ReentrancyGuardStack());
+        }
+
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.CustomAttribute;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Constructor = visitor.Visit(this, Constructor);
+            Blob.Visit(this, visitor);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as CustomAttribute;
+            if (other == null) return false;
+            if (_equalsReentrancyGuard.Value.Contains(other))
+                return true;
+            _equalsReentrancyGuard.Value.Push(other);
+            try
+            {
+            if (!Object.Equals(Constructor, other.Constructor)) return false;
+            if (!Blob.Equals(other.Blob)) return false;
+            }
+            finally
+            {
+                var popped = _equalsReentrancyGuard.Value.Pop();
+                Debug.Assert(Object.ReferenceEquals(other, popped));
+            }
+            return true;
+        } // Equals
+        private ThreadLocal<ReentrancyGuardStack> _equalsReentrancyGuard;
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(478371161);
+            hash.Add(Constructor);
+            hash.Add(Blob);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Constructor == null ||
+                Constructor.HandleType == HandleType.QualifiedMethod ||
+                Constructor.HandleType == HandleType.MemberReference);
+            writer.Write(Constructor);
+            Blob.Save(writer);
+        } // Save
+
+        internal static CustomAttributeHandle AsHandle(CustomAttribute record)
+        {
+            if (record == null)
+            {
+                return new CustomAttributeHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new CustomAttributeHandle Handle
+        {
+            get
+            {
+                return new CustomAttributeHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Constructor;
+        public MetadataBlob Blob = new MetadataBlob();
+    } // CustomAttribute
+
+    public partial class Event : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.Event;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Type = visitor.Visit(this, Type);
+            MethodSemantics = visitor.Visit(this, MethodSemantics);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as Event;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Object.Equals(Type, other.Type)) return false;
+            if (!MethodSemantics.SequenceEqual(other.MethodSemantics)) return false;
+            if (!CustomAttributes.SequenceEqual(other.CustomAttributes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1454825650);
+            hash.Add(Flags);
+            hash.Add(Name);
+            hash.Add(Type);
+            for (int i = 0; i < MethodSemantics.Count; i++)
+                hash.Add(MethodSemantics[i]);
+            for (int i = 0; i < CustomAttributes.Count; i++)
+                hash.Add(CustomAttributes[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(Name);
+            Debug.Assert(Type == null ||
+                Type.HandleType == HandleType.TypeDefinition ||
+                Type.HandleType == HandleType.TypeReference ||
+                Type.HandleType == HandleType.TypeSpecification);
+            writer.Write(Type);
+            writer.Write(MethodSemantics);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static EventHandle AsHandle(Event record)
+        {
+            if (record == null)
+            {
+                return new EventHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new EventHandle Handle
+        {
+            get
+            {
+                return new EventHandle(HandleOffset);
+            }
+        } // Handle
+
+        public EventAttributes Flags;
+        public ConstantStringValue Name;
+        public MetadataRecord Type;
+        public List<MethodSemantics> MethodSemantics = new List<MethodSemantics>();
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // Event
+
+    public partial class Field : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.Field;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Signature = visitor.Visit(this, Signature);
+            DefaultValue = visitor.Visit(this, DefaultValue);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as Field;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Object.Equals(Signature, other.Signature)) return false;
+            if (!Object.Equals(DefaultValue, other.DefaultValue)) return false;
+            if (Offset != other.Offset) return false;
+            if (!CustomAttributes.SequenceEqual(other.CustomAttributes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-540975116);
+            hash.Add(Flags);
+            hash.Add(Name);
+            hash.Add(Signature);
+            hash.Add(DefaultValue);
+            hash.Add(Offset);
+            for (int i = 0; i < CustomAttributes.Count; i++)
+                hash.Add(CustomAttributes[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(Name);
+            writer.Write(Signature);
+            writer.Write(DefaultValue);
+            writer.Write(Offset);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static FieldHandle AsHandle(Field record)
+        {
+            if (record == null)
+            {
+                return new FieldHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new FieldHandle Handle
+        {
+            get
+            {
+                return new FieldHandle(HandleOffset);
+            }
+        } // Handle
+
+        public FieldAttributes Flags;
+        public ConstantStringValue Name;
+        public FieldSignature Signature;
+        public Constant DefaultValue;
+        public uint Offset;
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // Field
+
+    public partial class FieldSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.FieldSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Type = visitor.Visit(this, Type);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as FieldSignature;
+            if (other == null) return false;
+            if (!Object.Equals(Type, other.Type)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1865977400);
+            hash.Add(Type);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Type == null ||
+                Type.HandleType == HandleType.TypeDefinition ||
+                Type.HandleType == HandleType.TypeReference ||
+                Type.HandleType == HandleType.TypeSpecification ||
+                Type.HandleType == HandleType.ModifiedType);
+            writer.Write(Type);
+        } // Save
+
+        internal static FieldSignatureHandle AsHandle(FieldSignature record)
+        {
+            if (record == null)
+            {
+                return new FieldSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new FieldSignatureHandle Handle
+        {
+            get
+            {
+                return new FieldSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Type;
+    } // FieldSignature
+
+    public partial class FunctionPointerSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.FunctionPointerSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Signature = visitor.Visit(this, Signature);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as FunctionPointerSignature;
+            if (other == null) return false;
+            if (!Object.Equals(Signature, other.Signature)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1400760676);
+            hash.Add(Signature);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Signature);
+        } // Save
+
+        internal static FunctionPointerSignatureHandle AsHandle(FunctionPointerSignature record)
+        {
+            if (record == null)
+            {
+                return new FunctionPointerSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new FunctionPointerSignatureHandle Handle
+        {
+            get
+            {
+                return new FunctionPointerSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MethodSignature Signature;
+    } // FunctionPointerSignature
+
+    public partial class GenericParameter : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.GenericParameter;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Constraints = visitor.Visit(this, Constraints);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as GenericParameter;
+            if (other == null) return false;
+            if (Number != other.Number) return false;
+            if (Flags != other.Flags) return false;
+            if (Kind != other.Kind) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Constraints.SequenceEqual(other.Constraints)) return false;
+            if (!CustomAttributes.SequenceEqual(other.CustomAttributes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1389630306);
+            hash.Add(Number);
+            hash.Add(Flags);
+            hash.Add(Kind);
+            hash.Add(Name);
+            for (int i = 0; i < Constraints.Count; i++)
+                hash.Add(Constraints[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Number);
+            writer.Write(Flags);
+            writer.Write(Kind);
+            writer.Write(Name);
+            Debug.Assert(Constraints.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification ||
+                handle.HandleType == HandleType.ModifiedType));
+            writer.Write(Constraints);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static GenericParameterHandle AsHandle(GenericParameter record)
+        {
+            if (record == null)
+            {
+                return new GenericParameterHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new GenericParameterHandle Handle
+        {
+            get
+            {
+                return new GenericParameterHandle(HandleOffset);
+            }
+        } // Handle
+
+        public ushort Number;
+        public GenericParameterAttributes Flags;
+        public GenericParameterKind Kind;
+        public ConstantStringValue Name;
+        public List<MetadataRecord> Constraints = new List<MetadataRecord>();
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // GenericParameter
+
+    public partial class MemberReference : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.MemberReference;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Parent = visitor.Visit(this, Parent);
+            Name = visitor.Visit(this, Name);
+            Signature = visitor.Visit(this, Signature);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as MemberReference;
+            if (other == null) return false;
+            if (!Object.Equals(Parent, other.Parent)) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Object.Equals(Signature, other.Signature)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-875402938);
+            hash.Add(Parent);
+            hash.Add(Name);
+            hash.Add(Signature);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Parent == null ||
+                Parent.HandleType == HandleType.TypeDefinition ||
+                Parent.HandleType == HandleType.TypeReference ||
+                Parent.HandleType == HandleType.TypeSpecification);
+            writer.Write(Parent);
+            writer.Write(Name);
+            Debug.Assert(Signature == null ||
+                Signature.HandleType == HandleType.MethodSignature ||
+                Signature.HandleType == HandleType.FieldSignature);
+            writer.Write(Signature);
+        } // Save
+
+        internal static MemberReferenceHandle AsHandle(MemberReference record)
+        {
+            if (record == null)
+            {
+                return new MemberReferenceHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new MemberReferenceHandle Handle
+        {
+            get
+            {
+                return new MemberReferenceHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Parent;
+        public ConstantStringValue Name;
+        public MetadataRecord Signature;
+    } // MemberReference
+
+    public partial class Method : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.Method;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Signature = visitor.Visit(this, Signature);
+            Parameters = visitor.Visit(this, Parameters);
+            GenericParameters = visitor.Visit(this, GenericParameters);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as Method;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (ImplFlags != other.ImplFlags) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Object.Equals(Signature, other.Signature)) return false;
+            if (!Parameters.SequenceEqual(other.Parameters)) return false;
+            if (!GenericParameters.SequenceEqual(other.GenericParameters)) return false;
+            if (!CustomAttributes.SequenceEqual(other.CustomAttributes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1225154478);
+            hash.Add(Flags);
+            hash.Add(ImplFlags);
+            hash.Add(Name);
+            hash.Add(Signature);
+            for (int i = 0; i < Parameters.Count; i++)
+                hash.Add(Parameters[i]);
+            for (int i = 0; i < GenericParameters.Count; i++)
+                hash.Add(GenericParameters[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(ImplFlags);
+            writer.Write(Name);
+            writer.Write(Signature);
+            writer.Write(Parameters);
+            writer.Write(GenericParameters);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static MethodHandle AsHandle(Method record)
+        {
+            if (record == null)
+            {
+                return new MethodHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new MethodHandle Handle
+        {
+            get
+            {
+                return new MethodHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MethodAttributes Flags;
+        public MethodImplAttributes ImplFlags;
+        public ConstantStringValue Name;
+        public MethodSignature Signature;
+        public List<Parameter> Parameters = new List<Parameter>();
+        public List<GenericParameter> GenericParameters = new List<GenericParameter>();
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // Method
+
+    public partial class MethodInstantiation : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.MethodInstantiation;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Method = visitor.Visit(this, Method);
+            GenericTypeArguments = visitor.Visit(this, GenericTypeArguments);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as MethodInstantiation;
+            if (other == null) return false;
+            if (!Object.Equals(Method, other.Method)) return false;
+            if (!GenericTypeArguments.SequenceEqual(other.GenericTypeArguments)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1777408040);
+            hash.Add(Method);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Method == null ||
+                Method.HandleType == HandleType.QualifiedMethod ||
+                Method.HandleType == HandleType.MemberReference);
+            writer.Write(Method);
+            Debug.Assert(GenericTypeArguments.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification ||
+                handle.HandleType == HandleType.ModifiedType));
+            writer.Write(GenericTypeArguments);
+        } // Save
+
+        internal static MethodInstantiationHandle AsHandle(MethodInstantiation record)
+        {
+            if (record == null)
+            {
+                return new MethodInstantiationHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new MethodInstantiationHandle Handle
+        {
+            get
+            {
+                return new MethodInstantiationHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Method;
+        public List<MetadataRecord> GenericTypeArguments = new List<MetadataRecord>();
+    } // MethodInstantiation
+
+    public partial class MethodSemantics : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.MethodSemantics;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Method = visitor.Visit(this, Method);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as MethodSemantics;
+            if (other == null) return false;
+            if (Attributes != other.Attributes) return false;
+            if (!Object.Equals(Method, other.Method)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1967828724);
+            hash.Add(Attributes);
+            hash.Add(Method);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Attributes);
+            writer.Write(Method);
+        } // Save
+
+        internal static MethodSemanticsHandle AsHandle(MethodSemantics record)
+        {
+            if (record == null)
+            {
+                return new MethodSemanticsHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new MethodSemanticsHandle Handle
+        {
+            get
+            {
+                return new MethodSemanticsHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MethodSemanticsAttributes Attributes;
+        public Method Method;
+    } // MethodSemantics
+
+    public partial class MethodSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.MethodSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            ReturnType = visitor.Visit(this, ReturnType);
+            Parameters = visitor.Visit(this, Parameters);
+            VarArgParameters = visitor.Visit(this, VarArgParameters);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as MethodSignature;
+            if (other == null) return false;
+            if (CallingConvention != other.CallingConvention) return false;
+            if (GenericParameterCount != other.GenericParameterCount) return false;
+            if (!Object.Equals(ReturnType, other.ReturnType)) return false;
+            if (!Parameters.SequenceEqual(other.Parameters)) return false;
+            if (!VarArgParameters.SequenceEqual(other.VarArgParameters)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1362083279);
+            hash.Add(CallingConvention);
+            hash.Add(GenericParameterCount);
+            hash.Add(ReturnType);
+            for (int i = 0; i < Parameters.Count; i++)
+                hash.Add(Parameters[i]);
+            for (int i = 0; i < VarArgParameters.Count; i++)
+                hash.Add(VarArgParameters[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(CallingConvention);
+            writer.Write(GenericParameterCount);
+            Debug.Assert(ReturnType == null ||
+                ReturnType.HandleType == HandleType.TypeDefinition ||
+                ReturnType.HandleType == HandleType.TypeReference ||
+                ReturnType.HandleType == HandleType.TypeSpecification ||
+                ReturnType.HandleType == HandleType.ModifiedType);
+            writer.Write(ReturnType);
+            Debug.Assert(Parameters.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification ||
+                handle.HandleType == HandleType.ModifiedType));
+            writer.Write(Parameters);
+            Debug.Assert(VarArgParameters.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification ||
+                handle.HandleType == HandleType.ModifiedType));
+            writer.Write(VarArgParameters);
+        } // Save
+
+        internal static MethodSignatureHandle AsHandle(MethodSignature record)
+        {
+            if (record == null)
+            {
+                return new MethodSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new MethodSignatureHandle Handle
+        {
+            get
+            {
+                return new MethodSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public SignatureCallingConvention CallingConvention;
+        public int GenericParameterCount;
+        public MetadataRecord ReturnType;
+        public List<MetadataRecord> Parameters = new List<MetadataRecord>();
+        public List<MetadataRecord> VarArgParameters = new List<MetadataRecord>();
+    } // MethodSignature
+
+    public partial class MethodTypeVariableSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.MethodTypeVariableSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as MethodTypeVariableSignature;
+            if (other == null) return false;
+            if (Number != other.Number) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(542622499);
+            hash.Add(Number);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Number);
+        } // Save
+
+        internal static MethodTypeVariableSignatureHandle AsHandle(MethodTypeVariableSignature record)
+        {
+            if (record == null)
+            {
+                return new MethodTypeVariableSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new MethodTypeVariableSignatureHandle Handle
+        {
+            get
+            {
+                return new MethodTypeVariableSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public int Number;
+    } // MethodTypeVariableSignature
+
+    public partial class ModifiedType : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ModifiedType;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            ModifierType = visitor.Visit(this, ModifierType);
+            Type = visitor.Visit(this, Type);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ModifiedType;
+            if (other == null) return false;
+            if (IsOptional != other.IsOptional) return false;
+            if (!Object.Equals(ModifierType, other.ModifierType)) return false;
+            if (!Object.Equals(Type, other.Type)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-707476144);
+            hash.Add(IsOptional);
+            hash.Add(ModifierType);
+            hash.Add(Type);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(IsOptional);
+            Debug.Assert(ModifierType == null ||
+                ModifierType.HandleType == HandleType.TypeDefinition ||
+                ModifierType.HandleType == HandleType.TypeReference ||
+                ModifierType.HandleType == HandleType.TypeSpecification);
+            writer.Write(ModifierType);
+            Debug.Assert(Type == null ||
+                Type.HandleType == HandleType.TypeDefinition ||
+                Type.HandleType == HandleType.TypeReference ||
+                Type.HandleType == HandleType.TypeSpecification ||
+                Type.HandleType == HandleType.ModifiedType);
+            writer.Write(Type);
+        } // Save
+
+        internal static ModifiedTypeHandle AsHandle(ModifiedType record)
+        {
+            if (record == null)
+            {
+                return new ModifiedTypeHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ModifiedTypeHandle Handle
+        {
+            get
+            {
+                return new ModifiedTypeHandle(HandleOffset);
+            }
+        } // Handle
+
+        public bool IsOptional;
+        public MetadataRecord ModifierType;
+        public MetadataRecord Type;
+    } // ModifiedType
+
+    public partial class NamespaceDefinition : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.NamespaceDefinition;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Scope = visitor.Visit(this, Scope);
+            Name = visitor.Visit(this, Name);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as NamespaceDefinition;
+            if (other == null) return false;
+            if (!Object.Equals(Scope, other.Scope)) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(633688634);
+            hash.Add(Scope);
+            hash.Add(Name);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Scope);
+            writer.Write(Name);
+        } // Save
+
+        internal static NamespaceDefinitionHandle AsHandle(NamespaceDefinition record)
+        {
+            if (record == null)
+            {
+                return new NamespaceDefinitionHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new NamespaceDefinitionHandle Handle
+        {
+            get
+            {
+                return new NamespaceDefinitionHandle(HandleOffset);
+            }
+        } // Handle
+
+        public ScopeDefinition Scope;
+        public ConstantStringValue Name;
+    } // NamespaceDefinition
+
+    public partial class NamespaceReference : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.NamespaceReference;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Scope = visitor.Visit(this, Scope);
+            Name = visitor.Visit(this, Name);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as NamespaceReference;
+            if (other == null) return false;
+            if (!Object.Equals(Scope, other.Scope)) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1563382231);
+            hash.Add(Scope);
+            hash.Add(Name);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Scope);
+            writer.Write(Name);
+        } // Save
+
+        internal static NamespaceReferenceHandle AsHandle(NamespaceReference record)
+        {
+            if (record == null)
+            {
+                return new NamespaceReferenceHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new NamespaceReferenceHandle Handle
+        {
+            get
+            {
+                return new NamespaceReferenceHandle(HandleOffset);
+            }
+        } // Handle
+
+        public ScopeReference Scope;
+        public ConstantStringValue Name;
+    } // NamespaceReference
+
+    public partial class Parameter : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.Parameter;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            DefaultValue = visitor.Visit(this, DefaultValue);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as Parameter;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (Sequence != other.Sequence) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Object.Equals(DefaultValue, other.DefaultValue)) return false;
+            if (!CustomAttributes.SequenceEqual(other.CustomAttributes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1049753891);
+            hash.Add(Flags);
+            hash.Add(Sequence);
+            hash.Add(Name);
+            hash.Add(DefaultValue);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(Sequence);
+            writer.Write(Name);
+            writer.Write(DefaultValue);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static ParameterHandle AsHandle(Parameter record)
+        {
+            if (record == null)
+            {
+                return new ParameterHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ParameterHandle Handle
+        {
+            get
+            {
+                return new ParameterHandle(HandleOffset);
+            }
+        } // Handle
+
+        public ParameterAttributes Flags;
+        public ushort Sequence;
+        public ConstantStringValue Name;
+        public Constant DefaultValue;
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // Parameter
+
+    public partial class PointerSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.PointerSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Type = visitor.Visit(this, Type);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as PointerSignature;
+            if (other == null) return false;
+            if (!Object.Equals(Type, other.Type)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(747249584);
+            hash.Add(Type);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Type == null ||
+                Type.HandleType == HandleType.TypeDefinition ||
+                Type.HandleType == HandleType.TypeReference ||
+                Type.HandleType == HandleType.TypeSpecification ||
+                Type.HandleType == HandleType.ModifiedType);
+            writer.Write(Type);
+        } // Save
+
+        internal static PointerSignatureHandle AsHandle(PointerSignature record)
+        {
+            if (record == null)
+            {
+                return new PointerSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new PointerSignatureHandle Handle
+        {
+            get
+            {
+                return new PointerSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Type;
+    } // PointerSignature
+
+    public partial class Property : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.Property;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Signature = visitor.Visit(this, Signature);
+            MethodSemantics = visitor.Visit(this, MethodSemantics);
+            DefaultValue = visitor.Visit(this, DefaultValue);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as Property;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!Object.Equals(Signature, other.Signature)) return false;
+            if (!MethodSemantics.SequenceEqual(other.MethodSemantics)) return false;
+            if (!Object.Equals(DefaultValue, other.DefaultValue)) return false;
+            if (!CustomAttributes.SequenceEqual(other.CustomAttributes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1324612544);
+            hash.Add(Flags);
+            hash.Add(Name);
+            hash.Add(Signature);
+            for (int i = 0; i < MethodSemantics.Count; i++)
+                hash.Add(MethodSemantics[i]);
+            hash.Add(DefaultValue);
+            for (int i = 0; i < CustomAttributes.Count; i++)
+                hash.Add(CustomAttributes[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(Name);
+            writer.Write(Signature);
+            writer.Write(MethodSemantics);
+            writer.Write(DefaultValue);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static PropertyHandle AsHandle(Property record)
+        {
+            if (record == null)
+            {
+                return new PropertyHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new PropertyHandle Handle
+        {
+            get
+            {
+                return new PropertyHandle(HandleOffset);
+            }
+        } // Handle
+
+        public PropertyAttributes Flags;
+        public ConstantStringValue Name;
+        public PropertySignature Signature;
+        public List<MethodSemantics> MethodSemantics = new List<MethodSemantics>();
+        public Constant DefaultValue;
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // Property
+
+    public partial class PropertySignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.PropertySignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Type = visitor.Visit(this, Type);
+            Parameters = visitor.Visit(this, Parameters);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as PropertySignature;
+            if (other == null) return false;
+            if (CallingConvention != other.CallingConvention) return false;
+            if (!Object.Equals(Type, other.Type)) return false;
+            if (!Parameters.SequenceEqual(other.Parameters)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1535652143);
+            hash.Add(CallingConvention);
+            hash.Add(Type);
+            for (int i = 0; i < Parameters.Count; i++)
+                hash.Add(Parameters[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(CallingConvention);
+            Debug.Assert(Type == null ||
+                Type.HandleType == HandleType.TypeDefinition ||
+                Type.HandleType == HandleType.TypeReference ||
+                Type.HandleType == HandleType.TypeSpecification ||
+                Type.HandleType == HandleType.ModifiedType);
+            writer.Write(Type);
+            Debug.Assert(Parameters.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification ||
+                handle.HandleType == HandleType.ModifiedType));
+            writer.Write(Parameters);
+        } // Save
+
+        internal static PropertySignatureHandle AsHandle(PropertySignature record)
+        {
+            if (record == null)
+            {
+                return new PropertySignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new PropertySignatureHandle Handle
+        {
+            get
+            {
+                return new PropertySignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public CallingConventions CallingConvention;
+        public MetadataRecord Type;
+        public List<MetadataRecord> Parameters = new List<MetadataRecord>();
+    } // PropertySignature
+
+    public partial class QualifiedField : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.QualifiedField;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Field = visitor.Visit(this, Field);
+            EnclosingType = visitor.Visit(this, EnclosingType);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as QualifiedField;
+            if (other == null) return false;
+            if (!Object.Equals(Field, other.Field)) return false;
+            if (!Object.Equals(EnclosingType, other.EnclosingType)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1470437688);
+            hash.Add(Field);
+            hash.Add(EnclosingType);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Field);
+            writer.Write(EnclosingType);
+        } // Save
+
+        internal static QualifiedFieldHandle AsHandle(QualifiedField record)
+        {
+            if (record == null)
+            {
+                return new QualifiedFieldHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new QualifiedFieldHandle Handle
+        {
+            get
+            {
+                return new QualifiedFieldHandle(HandleOffset);
+            }
+        } // Handle
+
+        public Field Field;
+        public TypeDefinition EnclosingType;
+    } // QualifiedField
+
+    public partial class QualifiedMethod : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.QualifiedMethod;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Method = visitor.Visit(this, Method);
+            EnclosingType = visitor.Visit(this, EnclosingType);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as QualifiedMethod;
+            if (other == null) return false;
+            if (!Object.Equals(Method, other.Method)) return false;
+            if (!Object.Equals(EnclosingType, other.EnclosingType)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-620024567);
+            hash.Add(Method);
+            hash.Add(EnclosingType);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Method);
+            writer.Write(EnclosingType);
+        } // Save
+
+        internal static QualifiedMethodHandle AsHandle(QualifiedMethod record)
+        {
+            if (record == null)
+            {
+                return new QualifiedMethodHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new QualifiedMethodHandle Handle
+        {
+            get
+            {
+                return new QualifiedMethodHandle(HandleOffset);
+            }
+        } // Handle
+
+        public Method Method;
+        public TypeDefinition EnclosingType;
+    } // QualifiedMethod
+
+    public partial class SZArraySignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.SZArraySignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            ElementType = visitor.Visit(this, ElementType);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as SZArraySignature;
+            if (other == null) return false;
+            if (!Object.Equals(ElementType, other.ElementType)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-179535243);
+            hash.Add(ElementType);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(ElementType == null ||
+                ElementType.HandleType == HandleType.TypeDefinition ||
+                ElementType.HandleType == HandleType.TypeReference ||
+                ElementType.HandleType == HandleType.TypeSpecification ||
+                ElementType.HandleType == HandleType.ModifiedType);
+            writer.Write(ElementType);
+        } // Save
+
+        internal static SZArraySignatureHandle AsHandle(SZArraySignature record)
+        {
+            if (record == null)
+            {
+                return new SZArraySignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new SZArraySignatureHandle Handle
+        {
+            get
+            {
+                return new SZArraySignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord ElementType;
+    } // SZArraySignature
+
+    public partial class ScopeDefinition : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ScopeDefinition;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Culture = visitor.Visit(this, Culture);
+            TypeDefinitions = visitor.Visit(this, TypeDefinitions);
+            TypeForwarders = visitor.Visit(this, TypeForwarders);
+            EntryPoint = visitor.Visit(this, EntryPoint);
+            GlobalModuleType = visitor.Visit(this, GlobalModuleType);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+            ModuleName = visitor.Visit(this, ModuleName);
+            ModuleCustomAttributes = visitor.Visit(this, ModuleCustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ScopeDefinition;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (MajorVersion != other.MajorVersion) return false;
+            if (MinorVersion != other.MinorVersion) return false;
+            if (BuildNumber != other.BuildNumber) return false;
+            if (RevisionNumber != other.RevisionNumber) return false;
+            if (!PublicKey.SequenceEqual(other.PublicKey)) return false;
+            if (!Object.Equals(Culture, other.Culture)) return false;
+            if (!Object.Equals(ModuleName, other.ModuleName)) return false;
+            if (!Mvid.SequenceEqual(other.Mvid)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(1490364984);
+            hash.Add(Flags);
+            hash.Add(Name);
+            hash.Add(MajorVersion);
+            hash.Add(MinorVersion);
+            hash.Add(BuildNumber);
+            hash.Add(RevisionNumber);
+            for (int i = 0; i < PublicKey.Length; i++)
+                hash.Add(PublicKey[i]);
+            hash.Add(Culture);
+            hash.Add(ModuleName);
+            for (int i = 0; i < Mvid.Length; i++)
+                hash.Add(Mvid[i]);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void PlaceHashtables(Section section)
+        {
+            Debug.Assert(_typeDefinitionsHashtable is null);
+            _typeDefinitionsHashtable = new VertexHashtable();
+
+            foreach (TypeDefinition record in TypeDefinitions)
+            {
+                _typeDefinitionsHashtable.Append((uint)record.GetLookupHashCode(), record);
+            }
+            section.Place(_typeDefinitionsHashtable);
+            Debug.Assert(_typeForwardersHashtable is null);
+            _typeForwardersHashtable = new VertexHashtable();
+
+            foreach (TypeForwarder record in TypeForwarders)
+            {
+                _typeForwardersHashtable.Append((uint)record.GetLookupHashCode(), record);
+            }
+            section.Place(_typeForwardersHashtable);
+        } // PlaceHashtables
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(Name);
+            writer.Write(MajorVersion);
+            writer.Write(MinorVersion);
+            writer.Write(BuildNumber);
+            writer.Write(RevisionNumber);
+            writer.Write(PublicKey);
+            writer.Write(Culture);
+            writer.WriteRelativeOffset(_typeDefinitionsHashtable);
+            writer.WriteRelativeOffset(_typeForwardersHashtable);
+            writer.Write(EntryPoint);
+            writer.Write(GlobalModuleType);
+            writer.Write(CustomAttributes);
+            writer.Write(ModuleName);
+            writer.Write(Mvid);
+            writer.Write(ModuleCustomAttributes);
+        } // Save
+
+        internal static ScopeDefinitionHandle AsHandle(ScopeDefinition record)
+        {
+            if (record == null)
+            {
+                return new ScopeDefinitionHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ScopeDefinitionHandle Handle
+        {
+            get
+            {
+                return new ScopeDefinitionHandle(HandleOffset);
+            }
+        } // Handle
+
+        public AssemblyFlags Flags;
+        public ConstantStringValue Name;
+        public ushort MajorVersion;
+        public ushort MinorVersion;
+        public ushort BuildNumber;
+        public ushort RevisionNumber;
+        public Byte[] PublicKey;
+        public ConstantStringValue Culture;
+        public List<TypeDefinition> TypeDefinitions = new List<TypeDefinition>();
+        private VertexHashtable _typeDefinitionsHashtable;
+        public List<TypeForwarder> TypeForwarders = new List<TypeForwarder>();
+        private VertexHashtable _typeForwardersHashtable;
+        public QualifiedMethod EntryPoint;
+        public TypeDefinition GlobalModuleType;
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+        public ConstantStringValue ModuleName;
+        public Byte[] Mvid;
+        public List<CustomAttribute> ModuleCustomAttributes = new List<CustomAttribute>();
+    } // ScopeDefinition
+
+    public partial class ScopeReference : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.ScopeReference;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Name = visitor.Visit(this, Name);
+            Culture = visitor.Visit(this, Culture);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as ScopeReference;
+            if (other == null) return false;
+            if (Flags != other.Flags) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (MajorVersion != other.MajorVersion) return false;
+            if (MinorVersion != other.MinorVersion) return false;
+            if (BuildNumber != other.BuildNumber) return false;
+            if (RevisionNumber != other.RevisionNumber) return false;
+            if (!PublicKeyOrToken.SequenceEqual(other.PublicKeyOrToken)) return false;
+            if (!Object.Equals(Culture, other.Culture)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(2056651797);
+            hash.Add(Flags);
+            hash.Add(Name);
+            hash.Add(MajorVersion);
+            hash.Add(MinorVersion);
+            hash.Add(BuildNumber);
+            hash.Add(RevisionNumber);
+            for (int i = 0; i < PublicKeyOrToken.Length; i++)
+                hash.Add(PublicKeyOrToken[i]);
+            hash.Add(Culture);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            writer.Write(Name);
+            writer.Write(MajorVersion);
+            writer.Write(MinorVersion);
+            writer.Write(BuildNumber);
+            writer.Write(RevisionNumber);
+            writer.Write(PublicKeyOrToken);
+            writer.Write(Culture);
+        } // Save
+
+        internal static ScopeReferenceHandle AsHandle(ScopeReference record)
+        {
+            if (record == null)
+            {
+                return new ScopeReferenceHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new ScopeReferenceHandle Handle
+        {
+            get
+            {
+                return new ScopeReferenceHandle(HandleOffset);
+            }
+        } // Handle
+
+        public AssemblyFlags Flags;
+        public ConstantStringValue Name;
+        public ushort MajorVersion;
+        public ushort MinorVersion;
+        public ushort BuildNumber;
+        public ushort RevisionNumber;
+        public Byte[] PublicKeyOrToken;
+        public ConstantStringValue Culture;
+    } // ScopeReference
+
+    public partial class TypeDefinition : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.TypeDefinition;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            BaseType = visitor.Visit(this, BaseType);
+            NamespaceOrEnclosingType = visitor.Visit(this, NamespaceOrEnclosingType);
+            Name = visitor.Visit(this, Name);
+            NestedTypes = visitor.Visit(this, NestedTypes);
+            Methods = visitor.Visit(this, Methods);
+            Fields = visitor.Visit(this, Fields);
+            Properties = visitor.Visit(this, Properties);
+            Events = visitor.Visit(this, Events);
+            GenericParameters = visitor.Visit(this, GenericParameters);
+            Interfaces = visitor.Visit(this, Interfaces);
+            CustomAttributes = visitor.Visit(this, CustomAttributes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as TypeDefinition;
+            if (other == null) return false;
+            if (!Object.Equals(NamespaceOrEnclosingType, other.NamespaceOrEnclosingType)) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-1095947977);
+            hash.Add(NamespaceOrEnclosingType);
+            hash.Add(Name);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Flags);
+            Debug.Assert(BaseType == null ||
+                BaseType.HandleType == HandleType.TypeDefinition ||
+                BaseType.HandleType == HandleType.TypeReference ||
+                BaseType.HandleType == HandleType.TypeSpecification);
+            writer.Write(BaseType);
+            Debug.Assert(NamespaceOrEnclosingType == null ||
+                NamespaceOrEnclosingType.HandleType == HandleType.NamespaceDefinition ||
+                NamespaceOrEnclosingType.HandleType == HandleType.TypeDefinition);
+            writer.Write(NamespaceOrEnclosingType);
+            writer.Write(Name);
+            writer.Write(Size);
+            writer.Write(PackingSize);
+            writer.Write(NestedTypes);
+            writer.Write(Methods);
+            writer.Write(Fields);
+            writer.Write(Properties);
+            writer.Write(Events);
+            writer.Write(GenericParameters);
+            Debug.Assert(Interfaces.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification));
+            writer.Write(Interfaces);
+            writer.Write(CustomAttributes);
+        } // Save
+
+        internal static TypeDefinitionHandle AsHandle(TypeDefinition record)
+        {
+            if (record == null)
+            {
+                return new TypeDefinitionHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new TypeDefinitionHandle Handle
+        {
+            get
+            {
+                return new TypeDefinitionHandle(HandleOffset);
+            }
+        } // Handle
+
+        public TypeAttributes Flags;
+        public MetadataRecord BaseType;
+        public MetadataRecord NamespaceOrEnclosingType;
+        public ConstantStringValue Name;
+        public uint Size;
+        public ushort PackingSize;
+        public List<TypeDefinition> NestedTypes = new List<TypeDefinition>();
+        public List<Method> Methods = new List<Method>();
+        public List<Field> Fields = new List<Field>();
+        public List<Property> Properties = new List<Property>();
+        public List<Event> Events = new List<Event>();
+        public List<GenericParameter> GenericParameters = new List<GenericParameter>();
+        public List<MetadataRecord> Interfaces = new List<MetadataRecord>();
+        public List<CustomAttribute> CustomAttributes = new List<CustomAttribute>();
+    } // TypeDefinition
+
+    public partial class TypeForwarder : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.TypeForwarder;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Namespace = visitor.Visit(this, Namespace);
+            Name = visitor.Visit(this, Name);
+            NestedTypes = visitor.Visit(this, NestedTypes);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as TypeForwarder;
+            if (other == null) return false;
+            if (!Object.Equals(Namespace, other.Namespace)) return false;
+            if (!Object.Equals(Name, other.Name)) return false;
+            if (!NestedTypes.SequenceEqual(other.NestedTypes)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(467167184);
+            hash.Add(Namespace);
+            hash.Add(Name);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Namespace);
+            writer.Write(Name);
+            writer.Write(NestedTypes);
+        } // Save
+
+        internal static TypeForwarderHandle AsHandle(TypeForwarder record)
+        {
+            if (record == null)
+            {
+                return new TypeForwarderHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new TypeForwarderHandle Handle
+        {
+            get
+            {
+                return new TypeForwarderHandle(HandleOffset);
+            }
+        } // Handle
+
+        public NamespaceReference Namespace;
+        public ConstantStringValue Name;
+        public List<TypeForwarder> NestedTypes = new List<TypeForwarder>();
+    } // TypeForwarder
+
+    public partial class TypeInstantiationSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.TypeInstantiationSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            GenericType = visitor.Visit(this, GenericType);
+            GenericTypeArguments = visitor.Visit(this, GenericTypeArguments);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as TypeInstantiationSignature;
+            if (other == null) return false;
+            if (!Object.Equals(GenericType, other.GenericType)) return false;
+            if (!GenericTypeArguments.SequenceEqual(other.GenericTypeArguments)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(770132338);
+            hash.Add(GenericType);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(GenericType == null ||
+                GenericType.HandleType == HandleType.TypeDefinition ||
+                GenericType.HandleType == HandleType.TypeReference ||
+                GenericType.HandleType == HandleType.TypeSpecification);
+            writer.Write(GenericType);
+            Debug.Assert(GenericTypeArguments.TrueForAll(handle => handle == null ||
+                handle.HandleType == HandleType.TypeDefinition ||
+                handle.HandleType == HandleType.TypeReference ||
+                handle.HandleType == HandleType.TypeSpecification ||
+                handle.HandleType == HandleType.ModifiedType));
+            writer.Write(GenericTypeArguments);
+        } // Save
+
+        internal static TypeInstantiationSignatureHandle AsHandle(TypeInstantiationSignature record)
+        {
+            if (record == null)
+            {
+                return new TypeInstantiationSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new TypeInstantiationSignatureHandle Handle
+        {
+            get
+            {
+                return new TypeInstantiationSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord GenericType;
+        public List<MetadataRecord> GenericTypeArguments = new List<MetadataRecord>();
+    } // TypeInstantiationSignature
+
+    public partial class TypeReference : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.TypeReference;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            NamespaceOrEnclosingType = visitor.Visit(this, NamespaceOrEnclosingType);
+            TypeName = visitor.Visit(this, TypeName);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as TypeReference;
+            if (other == null) return false;
+            if (!Object.Equals(NamespaceOrEnclosingType, other.NamespaceOrEnclosingType)) return false;
+            if (!Object.Equals(TypeName, other.TypeName)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-540108450);
+            hash.Add(NamespaceOrEnclosingType);
+            hash.Add(TypeName);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(NamespaceOrEnclosingType == null ||
+                NamespaceOrEnclosingType.HandleType == HandleType.NamespaceReference ||
+                NamespaceOrEnclosingType.HandleType == HandleType.TypeReference);
+            writer.Write(NamespaceOrEnclosingType);
+            writer.Write(TypeName);
+        } // Save
+
+        internal static TypeReferenceHandle AsHandle(TypeReference record)
+        {
+            if (record == null)
+            {
+                return new TypeReferenceHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new TypeReferenceHandle Handle
+        {
+            get
+            {
+                return new TypeReferenceHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord NamespaceOrEnclosingType;
+        public ConstantStringValue TypeName;
+    } // TypeReference
+
+    public partial class TypeSpecification : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.TypeSpecification;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+            Signature = visitor.Visit(this, Signature);
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as TypeSpecification;
+            if (other == null) return false;
+            if (!Object.Equals(Signature, other.Signature)) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(-902636182);
+            hash.Add(Signature);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            Debug.Assert(Signature == null ||
+                Signature.HandleType == HandleType.TypeDefinition ||
+                Signature.HandleType == HandleType.TypeReference ||
+                Signature.HandleType == HandleType.TypeInstantiationSignature ||
+                Signature.HandleType == HandleType.SZArraySignature ||
+                Signature.HandleType == HandleType.ArraySignature ||
+                Signature.HandleType == HandleType.PointerSignature ||
+                Signature.HandleType == HandleType.FunctionPointerSignature ||
+                Signature.HandleType == HandleType.ByReferenceSignature ||
+                Signature.HandleType == HandleType.TypeVariableSignature ||
+                Signature.HandleType == HandleType.MethodTypeVariableSignature);
+            writer.Write(Signature);
+        } // Save
+
+        internal static TypeSpecificationHandle AsHandle(TypeSpecification record)
+        {
+            if (record == null)
+            {
+                return new TypeSpecificationHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new TypeSpecificationHandle Handle
+        {
+            get
+            {
+                return new TypeSpecificationHandle(HandleOffset);
+            }
+        } // Handle
+
+        public MetadataRecord Signature;
+    } // TypeSpecification
+
+    public partial class TypeVariableSignature : MetadataRecord
+    {
+        public override HandleType HandleType
+        {
+            get
+            {
+                return HandleType.TypeVariableSignature;
+            }
+        } // HandleType
+
+        internal override void Visit(IRecordVisitor visitor)
+        {
+        } // Visit
+
+        public override sealed bool Equals(Object obj)
+        {
+            if (Object.ReferenceEquals(this, obj)) return true;
+            var other = obj as TypeVariableSignature;
+            if (other == null) return false;
+            if (Number != other.Number) return false;
+            return true;
+        } // Equals
+
+        public override sealed int GetHashCode()
+        {
+            if (_hash != 0)
+                return _hash;
+            EnterGetHashCode();
+            var hash = new HashCode();
+            hash.Add(711693641);
+            hash.Add(Number);
+            LeaveGetHashCode();
+            _hash = hash.ToHashCode();
+            return _hash;
+        } // GetHashCode
+
+        internal override void Save(NativeWriter writer)
+        {
+            writer.Write(Number);
+        } // Save
+
+        internal static TypeVariableSignatureHandle AsHandle(TypeVariableSignature record)
+        {
+            if (record == null)
+            {
+                return new TypeVariableSignatureHandle(0);
+            }
+            else
+            {
+                return record.Handle;
+            }
+        } // AsHandle
+
+        internal new TypeVariableSignatureHandle Handle
+        {
+            get
+            {
+                return new TypeVariableSignatureHandle(HandleOffset);
+            }
+        } // Handle
+
+        public int Number;
+    } // TypeVariableSignature
+} // Internal.Metadata.NativeFormat.Writer

@@ -1,0 +1,121 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+#pragma once
+
+#define ___in       _SAL1_Source_(__in, (), _In_)
+#define ___out      _SAL1_Source_(__out, (), _Out_)
+
+#include <minipal/types.h>
+
+// Keep in sync with the definitions in dbgutil.cpp and daccess.h
+#define DACCESS_TABLE_SYMBOL "g_dacTable"
+#define CONTRACT_DESCRIPTOR_SYMBOL "DotNetRuntimeContractDescriptor"
+
+#ifdef HOST_64BIT
+#define PRIA "016"
+#else
+#define PRIA "08"
+#endif
+
+#ifdef HOST_UNIX
+#include "config.h"
+#endif
+
+#include <windows.h>
+#include <stdlib.h>
+#include <crtdbg.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <corhdr.h>
+#include <cor.h>
+#include <corsym.h>
+#include <clrdata.h>
+#include <xclrdata.h>
+#include <corerror.h>
+#include <cordebug.h>
+#include <xcordebug.h>
+#include <mscoree.h>
+typedef int T_CONTEXT;
+#include <dacprivate.h>
+
+#ifndef _ASSERTE
+#define _ASSERTE(expr) assert(expr)
+#define UNDEF__ASSERTE
+#endif // _ASSERTE
+
+#include <holder.h>
+
+#ifdef UNDEF__ASSERTE
+#undef _ASSERTE
+#undef UNDEF__ASSERTE
+#endif // UNDEF__ASSERTE
+
+#ifdef HOST_UNIX
+#include <minipal/strings.h>
+#include <minipal/utf8.h>
+#include <dn-u16.h>
+#include <dumpcommon.h>
+#include <clrconfignocache.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#ifndef __APPLE__
+#include <sys/procfs.h>
+#include <asm/ptrace.h>
+#endif
+#ifdef HAVE_PROCESS_VM_READV
+#include <sys/uio.h>
+#endif
+#include <dirent.h>
+#include <fcntl.h>
+#include <dlfcn.h>
+#ifdef __APPLE__
+#include <ELF.h>
+#else
+#include <elf.h>
+#include <link.h>
+#endif
+#else
+#include <winternl.h>
+#include <dbghelp.h>
+#endif
+#include <inttypes.h>
+#include <map>
+#include <set>
+#include <vector>
+#include <array>
+#include <string>
+
+#include "shared/createdumpcore.h"
+#ifdef HOST_UNIX
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include "../dbgutil/machoreader.h"
+#else
+#include "../dbgutil/elfreader.h"
+#endif
+#include "moduleinfo.h"
+#include "datatarget.h"
+#include "stackframe.h"
+#include "threadinfo.h"
+#include "crashinfo.h"
+#include "crashreportwriter.h"
+#include "shared/dumpwriter.h"
+#include "runtimeinfo.h"
+#endif
+
+extern MINIDUMP_TYPE GetMiniDumpType(DumpType dumpType);
+
+#ifdef HOST_WINDOWS
+extern std::string GetLastErrorString();
+extern DWORD GetTempPathWrapper(IN DWORD nBufferLength, OUT LPSTR lpBuffer);
+#else
+#define GetTempPathWrapper GetTempPathA
+#endif

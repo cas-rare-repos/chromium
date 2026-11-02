@@ -1,0 +1,146 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Collections.Generic;
+using System.Reflection;
+using System.Reflection.Metadata;
+
+using ILCompiler.Dataflow;
+using ILCompiler.DependencyAnalysisFramework;
+using ILCompiler.Logging;
+
+using Internal.TypeSystem;
+
+using Debug = System.Diagnostics.Debug;
+using EcmaMethod = Internal.TypeSystem.Ecma.EcmaMethod;
+using EcmaType = Internal.TypeSystem.Ecma.EcmaType;
+
+namespace ILCompiler.DependencyAnalysis
+{
+    /// <summary>
+    /// Represents a method that has metadata generated in the current compilation.
+    /// This corresponds to a ECMA-335 MethodDef record. It is however not a 1:1
+    /// mapping because a method could be used in the AOT compiled program without generating
+    /// the reflection metadata for it (which would not be possible in IL terms).
+    /// </summary>
+    /// <remarks>
+    /// Only expected to be used during ILScanning when scanning for reflection.
+    /// </remarks>
+    internal sealed class MethodMetadataNode : DependencyNodeCore<NodeFactory>
+    {
+        private readonly EcmaMethod _method;
+        private readonly bool _isMinimal;
+
+        public MethodMetadataNode(MethodDesc method, bool isMinimal)
+        {
+            Debug.Assert(method.IsTypicalMethodDefinition);
+            _method = (EcmaMethod)method;
+            _isMinimal = isMinimal;
+        }
+
+        public MethodDesc Method => _method;
+
+        public override void AddStaticDependencies(DependencySink sink, NodeFactory factory)
+        {
+            var owningType = (MetadataType)_method.OwningType;
+            sink.Add(factory.TypeMetadata(owningType), "Owning type metadata");
+
+            if (!_isMinimal)
+            {
+                foreach (var parameterHandle in _method.MetadataReader.GetMethodDefinition(_method.Handle).GetParameters())
+                {
+                    sink.Add(factory.MethodParameterMetadata(new ReflectableParameter(_method.Module, parameterHandle)), "Parameter is visible");
+                }
+            }
+
+            MethodSignature sig = _method.Signature;
+            const string reason = "Method signature metadata";
+            TypeMetadataNode.AddMetadataDependencies(sink, factory, sig.ReturnType, reason);
+            foreach (TypeDesc paramType in sig)
+            {
+                TypeMetadataNode.AddMetadataDependencies(sink, factory, paramType, reason);
+            }
+
+            if (sig.HasEmbeddedSignatureData)
+            {
+                foreach (var sigData in sig.GetEmbeddedSignatureData())
+                    if (sigData.type != null)
+                        TypeMetadataNode.AddMetadataDependencies(sink, factory, sigData.type, "Modifier in a method signature");
+            }
+
+            if (!_isMinimal)
+            {
+                DynamicDependencyAttributesOnEntityNode.AddDependenciesDueToDynamicDependencyAttribute(sink, factory, _method);
+
+                // On a reflectable method, perform generic data flow for the return type and all the parameter types
+                // This is a compensation for the DI issue described in https://github.com/dotnet/runtime/issues/81358
+                GenericArgumentDataFlow.ProcessGenericArgumentDataFlow(sink, factory, new MessageOrigin(_method), _method.Signature.ReturnType, _method);
+
+                foreach (TypeDesc parameterType in _method.Signature)
+                {
+                    GenericArgumentDataFlow.ProcessGenericArgumentDataFlow(sink, factory, new MessageOrigin(_method), parameterType, _method);
+                }
+
+                if (_method.HasCustomAttribute("System.Diagnostics", "StackTraceHiddenAttribute")
+                    || owningType.HasCustomAttribute("System.Diagnostics", "StackTraceHiddenAttribute"))
+                {
+                    sink.Add(factory.AnalysisCharacteristic("StackTraceHiddenMetadataPresent"), "Method is StackTraceHidden");
+                }
+
+                // If this method is a property or event accessor, ensure metadata for the associated
+                // property or event is generated as well. Properties/events are not modeled as first-class
+                // entities in the type system, so we discover them here from their accessors.
+                // As a performance optimization, only SpecialName methods can be accessors.
+                if ((_method.Attributes & MethodAttributes.SpecialName) != 0)
+                {
+                    MetadataReader reader = _method.MetadataReader;
+                    MethodDefinitionHandle methodHandle = _method.Handle;
+                    TypeDefinition declaringType = reader.GetTypeDefinition(reader.GetMethodDefinition(methodHandle).GetDeclaringType());
+                    foreach (PropertyDefinitionHandle propertyHandle in declaringType.GetProperties())
+                    {
+                        PropertyAccessors accessors = reader.GetPropertyDefinition(propertyHandle).GetAccessors();
+                        if (accessors.Getter == methodHandle || accessors.Setter == methodHandle)
+                        {
+                            sink.Add(
+                                factory.PropertyMetadata(new PropertyPseudoDesc((EcmaType)owningType, propertyHandle)),
+                                "Property associated with reflectable accessor");
+                        }
+                    }
+
+                    foreach (EventDefinitionHandle eventHandle in declaringType.GetEvents())
+                    {
+                        EventAccessors accessors = reader.GetEventDefinition(eventHandle).GetAccessors();
+                        if (accessors.Adder == methodHandle || accessors.Remover == methodHandle || accessors.Raiser == methodHandle)
+                        {
+                            sink.Add(
+                                factory.EventMetadata(new EventPseudoDesc((EcmaType)owningType, eventHandle)),
+                                "Event associated with reflectable accessor");
+                        }
+                    }
+                }
+            }
+        }
+
+        public override void AddConditionalDependencies(DependencySink sink, NodeFactory factory)
+        {
+            CustomAttributeBasedDependencyAlgorithm.AddDependenciesDueToCustomAttributes(sink, factory, _method);
+        }
+
+        protected override string GetName(NodeFactory factory)
+        {
+            return "Method metadata: " + _method.ToString();
+        }
+
+        protected override void OnMarked(NodeFactory factory)
+        {
+            Debug.Assert(!factory.MetadataManager.IsReflectionBlocked(_method));
+            Debug.Assert(factory.MetadataManager.CanGenerateMetadata(_method));
+        }
+
+        public override bool InterestingForDynamicDependencyAnalysis => false;
+        public override bool HasDynamicDependencies => false;
+        public override bool HasConditionalStaticDependencies => !_isMinimal;
+        public override bool StaticDependenciesAreComputed => true;
+        public override void SearchDynamicDependencies(List<DependencyNodeCore<NodeFactory>> markedNodes, int firstNode, DependencySink sink, NodeFactory factory) { }
+    }
+}

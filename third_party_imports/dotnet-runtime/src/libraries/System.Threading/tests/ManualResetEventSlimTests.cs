@@ -1,0 +1,287 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Diagnostics;
+using System.Threading.Tasks;
+using Xunit;
+
+namespace System.Threading.Tests
+{
+    public class ManualResetEventSlimTests
+    {
+        [Theory]
+        [InlineData(false, 0)]
+        [InlineData(true, 0)]
+        [InlineData(false, 2047)]
+        [InlineData(true, 2047)]
+        public static void LazyWaitHandleTracksState(bool initialState, int spinCount)
+        {
+            using ManualResetEventSlim ev = new(initialState, spinCount);
+            Assert.Equal(Environment.ProcessorCount == 1 ? 1 : spinCount, ev.SpinCount);
+            WaitHandle handle = ev.WaitHandle;
+            Assert.Same(handle, ev.WaitHandle);
+            Assert.Equal(initialState, handle.WaitOne(0));
+
+            ev.Set();
+            Assert.True(ev.IsSet);
+            Assert.True(handle.WaitOne(0));
+            ev.Reset();
+            Assert.False(ev.IsSet);
+            Assert.False(handle.WaitOne(0));
+
+            ev.Dispose();
+            ev.Set();
+            Assert.True(ev.IsSet);
+            Assert.Throws<ObjectDisposedException>(() => handle.WaitOne(0));
+            Assert.Throws<ObjectDisposedException>(() => ev.Reset());
+        }
+
+        [ConditionalTheory(typeof(PlatformDetection), nameof(PlatformDetection.IsNotMultithreadingSupported))]
+        [InlineData(false, -1)]
+        [InlineData(true, -1)]
+        [InlineData(false, 0)]
+        [InlineData(true, 0)]
+        [InlineData(false, 1)]
+        [InlineData(true, 1)]
+        [InlineData(false, 20)]
+        [InlineData(true, 20)]
+        public static void SingleThreadedWaitHonorsFiniteTimeouts(bool initialState, int millisecondsTimeout)
+        {
+            using ManualResetEventSlim ev = new(initialState);
+            if (initialState)
+            {
+                Assert.True(ev.Wait(millisecondsTimeout));
+                Assert.True(ev.Wait(TimeSpan.FromMilliseconds(millisecondsTimeout)));
+            }
+            else if (millisecondsTimeout != Timeout.Infinite)
+            {
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                Assert.False(ev.Wait(millisecondsTimeout));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+                stopwatch.Restart();
+                Assert.False(ev.Wait(TimeSpan.FromMilliseconds(millisecondsTimeout)));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+            }
+            else
+            {
+                Assert.Throws<PlatformNotSupportedException>(() => ev.Wait(millisecondsTimeout));
+                Assert.Throws<PlatformNotSupportedException>(() => ev.Wait(TimeSpan.FromMilliseconds(millisecondsTimeout)));
+            }
+            Assert.Equal(initialState, ev.IsSet);
+        }
+
+        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsCoreCLR), nameof(PlatformDetection.IsNotMultithreadingSupported))]
+        public static void SingleThreadedWaitValidationOrder()
+        {
+            using CancellationTokenSource cancellation = new();
+            cancellation.Cancel();
+            using ManualResetEventSlim ev = new(true);
+            Assert.Throws<OperationCanceledException>(() => ev.Wait(-2, cancellation.Token));
+            Assert.Throws<ArgumentOutOfRangeException>(() => ev.Wait(-2, CancellationToken.None));
+            Assert.True(ev.Wait(0, CancellationToken.None));
+            ev.Reset();
+            Assert.False(ev.Wait(0, CancellationToken.None));
+            ev.Dispose();
+            Assert.Throws<ObjectDisposedException>(() => ev.Wait(-2, cancellation.Token));
+        }
+
+        [ConditionalTheory(typeof(PlatformDetection), nameof(PlatformDetection.IsBrowser), nameof(PlatformDetection.IsWasmThreadingSupported))]
+        [InlineData(0)]
+        [InlineData(20)]
+        public static void WaitOnJSInteropThreadHonorsFiniteTimeouts(int millisecondsTimeout)
+        {
+            using ManualResetEventSlim ev = new(false, 0);
+            ThreadTestHelpers.RunWithJSInteropBlockingPolicy(() =>
+            {
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                Assert.False(ev.Wait(millisecondsTimeout));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+                stopwatch.Restart();
+                Assert.False(ev.Wait(TimeSpan.FromMilliseconds(millisecondsTimeout)));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+                Assert.Throws<PlatformNotSupportedException>(() => ev.Wait());
+                ev.Set();
+                ev.Wait();
+            });
+        }
+
+        [ConditionalTheory(typeof(PlatformDetection), nameof(PlatformDetection.IsBrowser), nameof(PlatformDetection.IsWasmThreadingSupported))]
+        [InlineData(0)]
+        [InlineData(20)]
+        public static void TaskWaitsOnJSInteropThreadHonorFiniteTimeouts(int millisecondsTimeout)
+        {
+            Task incomplete = new TaskCompletionSource().Task;
+            ThreadTestHelpers.RunWithJSInteropBlockingPolicy(() =>
+            {
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                Assert.False(incomplete.Wait(millisecondsTimeout));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+                stopwatch.Restart();
+                Assert.False(Task.WaitAll([incomplete], millisecondsTimeout));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+                stopwatch.Restart();
+                Assert.Equal(-1, Task.WaitAny([incomplete], millisecondsTimeout));
+                Assert.InRange(stopwatch.Elapsed.TotalMilliseconds, Math.Max(0, millisecondsTimeout - 1), double.MaxValue);
+                Assert.Throws<PlatformNotSupportedException>(() => incomplete.Wait());
+                Assert.Throws<PlatformNotSupportedException>(() => Task.WaitAll([incomplete]));
+                Assert.Throws<PlatformNotSupportedException>(() => Task.WaitAny([incomplete]));
+            });
+        }
+
+        // Validates init, set, reset state transitions.
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public static void RunManualResetEventSlimTest0_StateTrans(bool init)
+        {
+            ManualResetEventSlim ev = new ManualResetEventSlim(init);
+            Assert.Equal(init, ev.IsSet);
+
+            for (int i = 0; i < 50; i++)
+            {
+                ev.Set();
+                Assert.True(ev.IsSet);
+
+                ev.Reset();
+                Assert.False(ev.IsSet);
+            }
+        }
+
+        // Uses 3 events to coordinate between two threads. Very little validation.
+        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsMultithreadingSupported))]
+        public static void RunManualResetEventSlimTest1_SimpleWait()
+        {
+            ManualResetEventSlim ev1 = new ManualResetEventSlim(false);
+            ManualResetEventSlim ev2 = new ManualResetEventSlim(false);
+            ManualResetEventSlim ev3 = new ManualResetEventSlim(false);
+
+            Task.Run(delegate
+            {
+                ev2.Set();
+                ev1.Wait();
+                ev3.Set();
+            });
+
+            ev2.Wait();
+            //Thread.Sleep(100);
+            ev1.Set();
+            ev3.Wait();
+        }
+
+        // Tests timeout on an event that is never set.
+        [Fact]
+        public static void RunManualResetEventSlimTest2_TimeoutWait()
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                ManualResetEventSlim ev = null;
+                if (i == 0) // no custom SpinCount
+                    ev = new ManualResetEventSlim(false);
+                else
+                    ev = new ManualResetEventSlim(false, 500);
+                Assert.False(ev.Wait(0));
+                Assert.False(ev.Wait(100));
+                Assert.False(ev.Wait(TimeSpan.FromMilliseconds(100)));
+
+                ev.Dispose();
+            }
+        }
+
+        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsNotMultithreadingSupported))]
+        public static void Wait_SingleThreaded()
+        {
+            using ManualResetEventSlim setEvent = new(true);
+            setEvent.Wait();
+            Assert.True(setEvent.Wait(1));
+            Assert.True(setEvent.Wait(TimeSpan.Zero));
+
+            using ManualResetEventSlim unsetEvent = new(false);
+            Assert.False(unsetEvent.Wait(0));
+            Assert.False(unsetEvent.Wait(TimeSpan.Zero));
+            Assert.False(unsetEvent.Wait(1));
+            Assert.Throws<PlatformNotSupportedException>(() => unsetEvent.Wait());
+        }
+
+        // Tests timeout on an event that is never set.
+        [Fact]
+        public static void RunManualResetEventSlimTest3_ConstructorTests()
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() => new ManualResetEventSlim(false, 2048)); //max value is 2047.
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => new ManualResetEventSlim(false, -1));
+        }
+
+        // Tests that the shared state variable seems to be working correctly.
+        [Fact]
+        public static void RunManualResetEventSlimTest4_CombinedStateTests()
+        {
+            ManualResetEventSlim mres = new ManualResetEventSlim(false, 100);
+            Assert.False(mres.IsSet,
+               "RunManualResetEventSlimTest4_CombinedStateTests:  FAILED.  Set did not read correctly.");
+            mres.Set();
+            Assert.True(mres.IsSet,
+               "RunManualResetEventSlimTest4_CombinedStateTests:  FAILED.  Set did not write/read correctly.");
+        }
+
+        [Fact]
+        public static void RunManualResetEventSlimTest5_Dispose()
+        {
+            ManualResetEventSlim mres = new ManualResetEventSlim(false);
+            mres.Dispose();
+        }
+
+        [Fact]
+        public static void RunManualResetEventSlimTest5_Dispose_Negative()
+        {
+            ManualResetEventSlim mres = new ManualResetEventSlim(false);
+            mres.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => mres.Reset());
+            // Failure Case: The object has been disposed, should throw ObjectDisposedException.
+
+            Assert.Throws<ObjectDisposedException>(() => mres.Wait(0));
+            // Failure Case: The object has been disposed, should throw ObjectDisposedException.
+
+            Assert.Throws<ObjectDisposedException>(
+                () =>
+                {
+                    WaitHandle handle = mres.WaitHandle;
+                });
+            // Failure Case: The object has been disposed, should throw ObjectDisposedException.
+
+            mres = new ManualResetEventSlim(false);
+
+            ManualResetEvent mre = (ManualResetEvent)mres.WaitHandle;
+            mres.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => mre.WaitOne(0));
+            // Failure Case: The underlying event object has been disposed, should throw ObjectDisposedException.
+
+        }
+
+        [Fact]
+        public static void RunManualResetEventSlimTest6_Exceptions()
+        {
+            ManualResetEventSlim mres = null;
+            Assert.Throws<ArgumentOutOfRangeException>(() => mres = new ManualResetEventSlim(false, -1));
+            // Failure Case: Constructor didn't throw AORE when -1 passed
+
+            mres = new ManualResetEventSlim(false);
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => mres.Wait(-2));
+            // Failure Case: Wait(int) didn't throw AORE when the totalmilliseconds < -1
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => mres.Wait(TimeSpan.FromDays(-1)));
+            // Failure Case: Wait(TimeSpan) didn't throw AORE when the totalmilliseconds < -1
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => mres.Wait(TimeSpan.MaxValue));
+            // Failure Case: Wait(TimeSpan, CancellationToken) didn't throw AORE when the totalmilliseconds > int.max
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => mres.Wait(TimeSpan.FromDays(-1), new CancellationToken()));
+            // Failure Case: Wait(TimeSpan) didn't throw AORE when the totalmilliseconds < -1
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => mres.Wait(TimeSpan.MaxValue, new CancellationToken()));
+            // Failure Case: Wait(TimeSpan, CancellationToken) didn't throw AORE when the totalmilliseconds > int.max
+        }
+    }
+}

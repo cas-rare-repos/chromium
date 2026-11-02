@@ -1,0 +1,73 @@
+﻿// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Diagnostics;
+using System.Collections.Generic;
+
+using ILCompiler.DependencyAnalysisFramework;
+
+using Internal.TypeSystem;
+
+namespace ILCompiler.DependencyAnalysis
+{
+    /// <summary>
+    /// Represents a use of a generic virtual method body implementation.
+    /// </summary>
+    public class GenericVirtualMethodImplNode : DependencyNodeCore<NodeFactory>
+    {
+        private readonly MethodDesc _method;
+
+        public GenericVirtualMethodImplNode(MethodDesc method)
+        {
+            Debug.Assert(method.GetCanonMethodTarget(CanonicalFormKind.Specific) == method);
+            Debug.Assert(method.HasInstantiation);
+
+            // This is either a generic virtual method or a MethodImpl for a static interface method.
+            // We can't test for static MethodImpl so at least sanity check it's static and nonabstract.
+            Debug.Assert(method.IsVirtual || (method.Signature.IsStatic && !method.IsAbstract));
+
+            _method = method;
+        }
+
+        public override bool HasConditionalStaticDependencies => false;
+        public override bool InterestingForDynamicDependencyAnalysis => false;
+        public override bool StaticDependenciesAreComputed => true;
+        protected override string GetName(NodeFactory factory) => "__GVMImplNode_" + factory.NameMangler.GetMangledMethodName(_method);
+
+        public override void AddStaticDependencies(DependencySink sink, NodeFactory factory)
+        {
+            factory.MetadataManager.AddDependenciesDueToVirtualMethodReflectability(sink, factory, _method);
+
+            bool validInstantiation =
+                _method.IsSharedByGenericInstantiations || (      // Non-exact methods are always valid instantiations (always pass constraints check)
+                    _method.Instantiation.CheckValidInstantiationArguments() &&
+                    _method.OwningType.Instantiation.CheckValidInstantiationArguments() &&
+                    _method.CheckConstraints());
+
+            if (validInstantiation)
+            {
+                bool getUnboxingStub = _method.OwningType.IsValueType && !_method.Signature.IsStatic;
+
+                sink.Add(factory.MethodEntrypoint(_method, getUnboxingStub), "GVM Dependency - Canon method");
+
+                if (_method.IsSharedByGenericInstantiations)
+                {
+                    sink.Add(factory.NativeLayout.TemplateMethodEntry(_method), "GVM Dependency - Template entry");
+                    sink.Add(factory.NativeLayout.TemplateMethodLayout(_method), "GVM Dependency - Template");
+                    sink.Add(factory.ShadowNonConcreteMethod(_method), "GVM Dependency - shadow generic method");
+                }
+                else
+                {
+                    sink.Add(factory.ExactMethodInstantiationsHashtableEntry(_method), "GVM Dependency - runtime lookups");
+                }
+            }
+
+        }
+
+        public override void AddConditionalDependencies(DependencySink sink, NodeFactory context) { }
+
+        public override bool HasDynamicDependencies => false;
+
+        public override void SearchDynamicDependencies(List<DependencyNodeCore<NodeFactory>> markedNodes, int firstNode, DependencySink sink, NodeFactory factory) { }
+    }
+}
