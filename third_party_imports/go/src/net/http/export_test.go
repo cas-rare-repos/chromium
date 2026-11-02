@@ -1,0 +1,265 @@
+// Copyright 2011 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Bridge package to expose http internals to tests in the http_test
+// package.
+
+package http
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/url"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+)
+
+var (
+	DefaultUserAgent                  = defaultUserAgent
+	NewLoggingConn                    = newLoggingConn
+	ExportRefererForURL               = refererForURL
+	ExportServerNewConn               = (*Server).newConn
+	ExportCloseWriteAndWait           = (*conn).closeWriteAndWait
+	ExportErrRequestCanceled          = errRequestCanceled
+	ExportErrRequestCanceledConn      = errRequestCanceledConn
+	ExportErrServerClosedIdle         = errServerClosedIdle
+	ExportServeFile                   = serveFile
+	ExportScanETag                    = scanETag
+	Export_shouldCopyHeaderOnRedirect = shouldCopyHeaderOnRedirect
+	Export_writeStatusLine            = writeStatusLine
+	Export_is408Message               = is408Message
+	MaxPostCloseReadTime              = maxPostCloseReadTime
+)
+
+var MaxWriteWaitBeforeConnReuse = &maxWriteWaitBeforeConnReuse
+
+func init() {
+	// We only want to pay for this cost during testing.
+	// When not under test, these values are always nil
+	// and never assigned to.
+	testHookMu = new(sync.Mutex)
+
+	testHookClientDoResult = func(res *Response, err error) {
+		if err != nil {
+			if _, ok := err.(*url.Error); !ok {
+				panic(fmt.Sprintf("unexpected Client.Do error of type %T; want *url.Error", err))
+			}
+		} else {
+			if res == nil {
+				panic("Client.Do returned nil, nil")
+			}
+			if res.Body == nil {
+				panic("Client.Do returned nil res.Body and no error")
+			}
+		}
+	}
+}
+
+func CondSkipHTTP2(t testing.TB) {
+	if omitHTTP2Server || omitHTTP2Client {
+		t.Skip("skipping HTTP/2 test when HTTP/2 server or client is omitted by build tag")
+	}
+}
+
+var (
+	SetEnterRoundTripHook = hookSetter(&testHookEnterRoundTrip)
+	SetRoundTripRetried   = hookSetter(&testHookRoundTripRetried)
+)
+
+func SetReadLoopBeforeNextReadHook(f func()) {
+	unnilTestHook(&f)
+	testHookReadLoopBeforeNextRead = f
+}
+
+// SetPendingDialHooks sets the hooks that run before and after handling
+// pending dials.
+func SetPendingDialHooks(t *testing.T, before, after func()) {
+	t.Cleanup(func() {
+		testHookPrePendingDial, testHookPostPendingDial = nil, nil
+	})
+	testHookPrePendingDial, testHookPostPendingDial = before, after
+}
+
+func SetTestHookServerServe(fn func(*Server, net.Listener)) { testHookServerServe = fn }
+
+func SetTestHookProxyConnectTimeout(t *testing.T, f func(context.Context, time.Duration) (context.Context, context.CancelFunc)) {
+	orig := testHookProxyConnectTimeout
+	t.Cleanup(func() {
+		testHookProxyConnectTimeout = orig
+	})
+	testHookProxyConnectTimeout = f
+}
+
+func NewTestTimeoutHandler(handler Handler, ctx context.Context) Handler {
+	return &timeoutHandler{
+		handler:     handler,
+		testContext: ctx,
+		// (no body)
+	}
+}
+
+func ResetCachedEnvironment() {
+	resetProxyConfig()
+}
+
+func (t *Transport) IdleConnKeysForTesting() (keys []string) {
+	for _, ent := range t.poolCopyEntries() {
+		ent.lock()
+		if len(ent.idleConns) > 0 {
+			keys = append(keys, ent.key.String())
+		}
+		ent.unlock(t)
+	}
+	slices.Sort(keys)
+	return
+}
+
+func (t *Transport) IdleConnKeyCountForTesting() int {
+	return len(t.IdleConnKeysForTesting())
+}
+
+func (t *Transport) IdleConnStrsForTesting() []string {
+	var ret []string
+	for _, ent := range t.poolCopyEntries() {
+		ent.lock()
+		for _, pconn := range ent.idleConns {
+			c := pconn.cc.NetConn()
+			if c == nil {
+				continue
+			}
+			ret = append(ret, c.LocalAddr().String()+"/"+c.RemoteAddr().String())
+		}
+		ent.unlock(t)
+	}
+	if t.h2Transport != nil {
+		ret = append(ret, t.h2Transport.IdleConnStrsForTesting()...)
+	}
+	slices.Sort(ret)
+	return ret
+}
+
+func (t *Transport) IdleConnCountForTesting(scheme, addr string) int {
+	key := connectMethodKey{"", scheme, addr, false}
+	ent := t.getLockedPoolEntry(key, false)
+	defer ent.unlock(t)
+	return len(ent.idleConns)
+}
+
+func (t *Transport) PoolEntryCountForTesting() int {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	return len(t.pool.ents)
+}
+
+// All test hooks must be non-nil so they can be called directly,
+// but the tests use nil to mean hook disabled.
+func unnilTestHook(f *func()) {
+	if *f == nil {
+		*f = nop
+	}
+}
+
+func hookSetter(dst *func()) func(func()) {
+	return func(fn func()) {
+		unnilTestHook(&fn)
+		*dst = fn
+	}
+}
+
+func (s *Server) ExportAllConnsIdle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for c := range s.activeConn {
+		st, unixSec := c.getState()
+		if unixSec == 0 || st != StateIdle {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) ExportAllConnsByState() map[ConnState]int {
+	states := map[ConnState]int{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for c := range s.activeConn {
+		st, _ := c.getState()
+		states[st] += 1
+	}
+	return states
+}
+
+func (r *Request) WithT(t *testing.T) *Request {
+	return r.WithContext(context.WithValue(r.Context(), tLogKey{}, t.Logf))
+}
+
+func (r *Request) ExportIsReplayable() bool { return r.isReplayable() }
+
+// ExportCloseTransportConnsAbruptly closes all idle connections from
+// tr in an abrupt way, just reaching into the underlying Conns and
+// closing them, without telling the Transport or its persistConns
+// that it's doing so. This is to simulate the server closing connections
+// on the Transport.
+func ExportCloseTransportConnsAbruptly(tr *Transport) {
+	tr.pool.mu.Lock()
+	pcs := slices.Collect(tr.pool.lru.all())
+	tr.pool.mu.Unlock()
+	for _, pconn := range pcs {
+		if c := pconn.cc.NetConn(); c != nil {
+			c.Close()
+		}
+	}
+}
+
+// ResponseWriterConnForTesting returns w's underlying connection, if w
+// is a regular *response ResponseWriter.
+func ResponseWriterConnForTesting(w ResponseWriter) (c net.Conn, ok bool) {
+	if r, ok := w.(*response); ok {
+		return r.conn.rwc, true
+	}
+	return nil, false
+}
+
+func init() {
+	// Set the default rstAvoidanceDelay to the minimum possible value to shake
+	// out tests that unexpectedly depend on it.
+	rstAvoidanceDelay = 1 * time.Nanosecond
+}
+
+// SetRSTAvoidanceDelay sets how long we are willing to wait between calling
+// CloseWrite on a connection and fully closing the connection.
+func SetRSTAvoidanceDelay(t *testing.T, d time.Duration) {
+	prevDelay := rstAvoidanceDelay
+	t.Cleanup(func() {
+		rstAvoidanceDelay = prevDelay
+	})
+	rstAvoidanceDelay = d
+}
+
+// SetHTTP3 adds or removes HTTP/3 from p.
+func (p *Protocols) SetHTTP3(ok bool) {
+	p.setHTTP3(ok)
+}
+
+type remapHTTP3Dialer struct {
+	http3Transport
+	closeIdleConnectionser
+	remap func(string) string
+}
+
+func (d remapHTTP3Dialer) DialClientConn(ctx context.Context, addr string, proxy *url.URL, tlsConfig *tls.Config, hook func()) (RoundTripper, error) {
+	return d.http3Transport.DialClientConn(ctx, d.remap(addr), proxy, tlsConfig, hook)
+}
+
+func (t *Transport) SetHTTP3DialAddrForTesting(remap func(string) string) {
+	t.h3Transport = remapHTTP3Dialer{
+		http3Transport:         t.h3Transport,
+		closeIdleConnectionser: t.h3Transport.(closeIdleConnectionser),
+		remap:                  remap,
+	}
+}

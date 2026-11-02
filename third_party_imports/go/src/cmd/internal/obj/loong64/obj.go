@@ -1,0 +1,686 @@
+// Copyright 2022 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package loong64
+
+import (
+	"cmd/internal/obj"
+	"cmd/internal/objabi"
+	"cmd/internal/src"
+	"cmd/internal/sys"
+	"internal/abi"
+	"log"
+	"math"
+)
+
+func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
+	// Rewrite JMP/JAL to symbol as TYPE_BRANCH.
+	switch p.As {
+	case AJMP, AJAL, ARET:
+		if p.To.Sym != nil {
+			p.To.Type = obj.TYPE_BRANCH
+		}
+	}
+
+	// Rewrite float constants to values stored in memory.
+	switch p.As {
+	case AMOVF:
+		if p.From.Type == obj.TYPE_FCONST {
+			f32 := float32(p.From.Val.(float64))
+			if math.Float32bits(f32) == 0 {
+				p.As = AMOVW
+				p.From.Type = obj.TYPE_REG
+				p.From.Reg = REGZERO
+				break
+			}
+			p.From.Type = obj.TYPE_MEM
+			p.From.Sym = ctxt.Float32Sym(f32)
+			p.From.Name = obj.NAME_EXTERN
+			p.From.Offset = 0
+		}
+
+	case AMOVD:
+		if p.From.Type == obj.TYPE_FCONST {
+			f64 := p.From.Val.(float64)
+			if math.Float64bits(f64) == 0 {
+				p.As = AMOVV
+				p.From.Type = obj.TYPE_REG
+				p.From.Reg = REGZERO
+				break
+			}
+			p.From.Type = obj.TYPE_MEM
+			p.From.Sym = ctxt.Float64Sym(f64)
+			p.From.Name = obj.NAME_EXTERN
+			p.From.Offset = 0
+		}
+	}
+
+	// Rewrite SUB constants into ADD.
+	switch p.As {
+	case ASUB:
+		if p.From.Type == obj.TYPE_CONST {
+			p.From.Offset = -p.From.Offset
+			p.As = AADD
+		}
+
+	case ASUBV:
+		if p.From.Type == obj.TYPE_CONST {
+			p.From.Offset = -p.From.Offset
+			p.As = AADDV
+		}
+
+	case ASUBVU:
+		if p.From.Type == obj.TYPE_CONST {
+			p.From.Offset = -p.From.Offset
+			p.As = AADDVU
+		}
+	}
+
+	if ctxt.Flag_dynlink {
+		rewriteToUseGot(ctxt, p, newprog)
+	}
+}
+
+func rewriteToUseGot(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
+	// We only care about global data: NAME_EXTERN means a global
+	// symbol in the Go sense, and p.Sym.Local is true for a few
+	// internally defined symbols.
+	if p.From.Type == obj.TYPE_ADDR && p.From.Name == obj.NAME_EXTERN && !p.From.Sym.Local() {
+		// MOVV $sym, Rx becomes MOVV sym@GOT, Rx
+		// MOVV $sym+<off>, Rx becomes MOVV sym@GOT, Rx; ADD <off>, Rx
+		if p.As != AMOVV {
+			ctxt.Diag("do not know how to handle TYPE_ADDR in %v with -shared", p)
+		}
+		if p.To.Type != obj.TYPE_REG {
+			ctxt.Diag("do not know how to handle LEAQ-type insn to non-register in %v with -shared", p)
+		}
+		p.From.Type = obj.TYPE_MEM
+		p.From.Name = obj.NAME_GOTREF
+		if p.From.Offset != 0 {
+			q := obj.Appendp(p, newprog)
+			q.As = AADDV
+			q.From.Type = obj.TYPE_CONST
+			q.From.Offset = p.From.Offset
+			q.To = p.To
+			p.From.Offset = 0
+		}
+	}
+	if p.GetFrom3() != nil && p.GetFrom3().Name == obj.NAME_EXTERN {
+		ctxt.Diag("don't know how to handle %v with -shared", p)
+	}
+
+	var source *obj.Addr
+	// MOVx sym, Ry becomes MOVV sym@GOT, REGTMP; MOVx (REGTMP), Ry
+	// MOVx Ry, sym becomes MOVV sym@GOT, REGTMP; MOVx Ry, (REGTMP)
+	// An addition may be inserted between the two MOVs if there is an offset.
+	if p.From.Name == obj.NAME_EXTERN && !p.From.Sym.Local() {
+		if p.To.Name == obj.NAME_EXTERN && !p.To.Sym.Local() {
+			ctxt.Diag("cannot handle NAME_EXTERN on both sides in %v with -shared", p)
+		}
+		source = &p.From
+	} else if p.To.Name == obj.NAME_EXTERN && !p.To.Sym.Local() {
+		source = &p.To
+	} else {
+		return
+	}
+	if p.As == obj.ATEXT || p.As == obj.AFUNCDATA || p.As == obj.ACALL || p.As == obj.ARET || p.As == obj.AJMP {
+		return
+	}
+	if source.Sym.Type == objabi.STLSBSS {
+		return
+	}
+	if source.Type != obj.TYPE_MEM {
+		ctxt.Diag("don't know how to handle %v with -shared", p)
+	}
+	p1 := obj.Appendp(p, newprog)
+	p2 := obj.Appendp(p1, newprog)
+	p1.As = AMOVV
+	p1.From.Type = obj.TYPE_MEM
+	p1.From.Sym = source.Sym
+	p1.From.Name = obj.NAME_GOTREF
+	p1.To.Type = obj.TYPE_REG
+	p1.To.Reg = REGTMP
+
+	p2.As = p.As
+	p2.From = p.From
+	p2.To = p.To
+	if p.From.Name == obj.NAME_EXTERN {
+		p2.From.Reg = REGTMP
+		p2.From.Name = obj.NAME_NONE
+		p2.From.Sym = nil
+	} else if p.To.Name == obj.NAME_EXTERN {
+		p2.To.Reg = REGTMP
+		p2.To.Name = obj.NAME_NONE
+		p2.To.Sym = nil
+	} else {
+		return
+	}
+
+	obj.Nopout(p)
+}
+
+func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
+	c := ctxt0{ctxt: ctxt, newprog: newprog, cursym: cursym}
+	p := c.cursym.Func().Text
+
+	if p == nil || p.Link == nil {
+		return
+	}
+
+	if p.As != obj.ATEXT {
+		c.ctxt.Diag("preprocess: found symbol that does not start with TEXT directive")
+		return
+	}
+
+	textstksiz := p.To.Offset
+	if textstksiz == -ctxt.Arch.FixedFrameSize {
+		// Historical way to mark NOFRAME.
+		p.From.Sym.Set(obj.AttrNoFrame, true)
+		textstksiz = 0
+	}
+
+	if textstksiz < 0 {
+		c.ctxt.Diag("negative frame size %d - did you mean NOFRAME?", textstksiz)
+	}
+
+	if p.From.Sym.NoFrame() {
+		if textstksiz != 0 {
+			c.ctxt.Diag("NOFRAME functions must have a frame size of 0, not %d", textstksiz)
+		}
+	}
+
+	if textstksiz%8 != 0 {
+		c.ctxt.Diag("frame size %d not a multiple of 8", textstksiz)
+	}
+
+	c.cursym.Func().Args = p.To.Val.(int32)
+	c.cursym.Func().Locals = int32(textstksiz)
+
+	/*
+	 * find leaf subroutines
+	 */
+	for p := c.cursym.Func().Text; p != nil; p = p.Link {
+		switch p.As {
+		case obj.ATEXT:
+			p.Mark |= LEAF
+
+		case AJAL:
+			c.cursym.Func().Text.Mark &^= LEAF
+		}
+	}
+
+	var q, q1 *obj.Prog
+	for p := c.cursym.Func().Text; p != nil; p = p.Link {
+		o := p.As
+		switch o {
+		case obj.ATEXT:
+			c.autosize = int32(textstksiz)
+			if p.Mark&LEAF != 0 && c.autosize == 0 {
+				// A leaf function with no locals has no frame.
+				p.From.Sym.Set(obj.AttrNoFrame, true)
+			}
+
+			if !p.From.Sym.NoFrame() {
+				// If there is a stack frame at all, it includes
+				// space to save the LR.
+				c.autosize += int32(c.ctxt.Arch.FixedFrameSize)
+			}
+
+			if p.Mark&LEAF != 0 && c.autosize < abi.StackSmall {
+				// A leaf function with a small stack can be marked
+				// NOSPLIT, avoiding a stack check.
+				p.From.Sym.Set(obj.AttrNoSplit, true)
+			}
+
+			if c.autosize == 0 && c.cursym.Func().Text.Mark&LEAF == 0 {
+				if c.cursym.Func().Text.From.Sym.NoSplit() {
+					if ctxt.Debugvlog {
+						ctxt.Logf("save suppressed in: %s\n", c.cursym.Name)
+					}
+
+					c.cursym.Func().Text.Mark |= LEAF
+				}
+			}
+
+			p.To.Offset = int64(c.autosize) - ctxt.Arch.FixedFrameSize
+
+			if c.cursym.Func().Text.Mark&LEAF != 0 {
+				c.cursym.Set(obj.AttrLeaf, true)
+				if p.From.Sym.NoFrame() {
+					break
+				}
+			}
+
+			if !p.From.Sym.NoSplit() {
+				p = c.stacksplit(p, c.autosize) // emit split check
+			}
+
+			q = p
+
+			if c.autosize != 0 {
+				// Make sure to save link register for non-empty frame, even if
+				// it is a leaf function, so that traceback works.
+				// Store link register before decrement SP, so if a signal comes
+				// during the execution of the function prologue, the traceback
+				// code will not see a half-updated stack frame.
+				// This sequence is not async preemptible, as if we open a frame
+				// at the current SP, it will clobber the saved LR.
+				q = c.ctxt.StartUnsafePoint(q, c.newprog)
+
+				// MOVV  REGLINK, -c.autosize(REGSP)
+				q = obj.Appendp(q, newprog)
+				q.As = AMOVV
+				q.Pos = p.Pos
+				q.From.Type = obj.TYPE_REG
+				q.From.Reg = REGLINK
+				q.To.Type = obj.TYPE_MEM
+				q.To.Offset = int64(-c.autosize)
+				q.To.Reg = REGSP
+
+				// ADDV  -c.autosize, REGSP
+				q = obj.Appendp(q, newprog)
+				q.As = AADDV
+				q.Pos = p.Pos
+				q.Pos = q.Pos.WithXlogue(src.PosPrologueEnd)
+				q.From.Type = obj.TYPE_CONST
+				q.From.Offset = int64(-c.autosize)
+				q.To.Type = obj.TYPE_REG
+				q.To.Reg = REGSP
+				q.Spadj = +c.autosize
+
+				q = c.ctxt.EndUnsafePoint(q, c.newprog, -1)
+
+				// On Linux, in a cgo binary we may get a SIGSETXID signal early on
+				// before the signal stack is set, as glibc doesn't allow us to block
+				// SIGSETXID. So a signal may land on the current stack and clobber
+				// the content below the SP. We store the LR again after the SP is
+				// decremented.
+				//
+				// MOVV  REGLINK, (REGSP)
+				q = obj.Appendp(q, newprog)
+				q.As = AMOVV
+				q.Pos = p.Pos
+				q.From.Type = obj.TYPE_REG
+				q.From.Reg = REGLINK
+				q.To.Type = obj.TYPE_MEM
+				q.To.Offset = 0
+				q.To.Reg = REGSP
+			}
+
+		case ARET:
+			if p.From.Type == obj.TYPE_CONST {
+				ctxt.Diag("using BECOME (%v) is not supported!", p)
+				break
+			}
+
+			retSym, retReg := p.To.Sym, p.To.Reg
+			if retReg == obj.REG_NONE {
+				retReg = REGLINK
+			}
+			p.To.Name = obj.NAME_NONE // clear fields as we may modify p to other instruction
+			p.To.Sym = nil
+			p.To.Reg = obj.REG_NONE
+
+			if c.cursym.Func().Text.Mark&LEAF != 0 {
+				if c.autosize == 0 {
+					p.As = AJMP
+					p.From = obj.Addr{}
+					if retSym != nil { // retjmp
+						p.To.Type = obj.TYPE_BRANCH
+						p.To.Name = obj.NAME_EXTERN
+						p.To.Sym = retSym
+					} else {
+						p.To.Type = obj.TYPE_MEM
+						p.To.Reg = retReg
+						p.To.Offset = 0
+					}
+					break
+				}
+
+				p.As = AADDV
+				p.From.Type = obj.TYPE_CONST
+				p.From.Offset = int64(c.autosize)
+				p.To.Type = obj.TYPE_REG
+				p.To.Reg = REGSP
+				p.Spadj = -c.autosize
+
+				q = c.newprog()
+				q.As = AJMP
+				q.Pos = p.Pos
+				if retSym != nil { // retjmp
+					q.To.Type = obj.TYPE_BRANCH
+					q.To.Name = obj.NAME_EXTERN
+					q.To.Sym = retSym
+				} else {
+					q.To.Type = obj.TYPE_MEM
+					q.To.Offset = 0
+					q.To.Reg = retReg
+				}
+				q.Spadj = +c.autosize
+
+				q.Link = p.Link
+				p.Link = q
+				break
+			}
+
+			p.As = AMOVV
+			p.From.Type = obj.TYPE_MEM
+			p.From.Offset = 0
+			p.From.Reg = REGSP
+			p.To.Type = obj.TYPE_REG
+			p.To.Reg = REGLINK
+
+			if c.autosize != 0 {
+				q = c.newprog()
+				q.As = AADDV
+				q.Pos = p.Pos
+				q.From.Type = obj.TYPE_CONST
+				q.From.Offset = int64(c.autosize)
+				q.To.Type = obj.TYPE_REG
+				q.To.Reg = REGSP
+				q.Spadj = -c.autosize
+
+				q.Link = p.Link
+				p.Link = q
+			}
+
+			q1 = c.newprog()
+			q1.As = AJMP
+			q1.Pos = p.Pos
+			if retSym != nil { // retjmp
+				q1.To.Type = obj.TYPE_BRANCH
+				q1.To.Name = obj.NAME_EXTERN
+				q1.To.Sym = retSym
+			} else {
+				q1.To.Type = obj.TYPE_MEM
+				q1.To.Offset = 0
+				q1.To.Reg = retReg
+			}
+			q1.Spadj = +c.autosize
+
+			q1.Link = q.Link
+			q.Link = q1
+
+		case AADD, AADDV, AADDVU:
+			if p.To.Type == obj.TYPE_REG && p.To.Reg == REGSP && p.From.Type == obj.TYPE_CONST {
+				p.Spadj = int32(-p.From.Offset)
+			}
+
+		case obj.AGETCALLERPC:
+			if cursym.Leaf() {
+				// MOV LR, Rd
+				p.As = AMOVV
+				p.From.Type = obj.TYPE_REG
+				p.From.Reg = REGLINK
+			} else {
+				// MOV (RSP), Rd
+				p.As = AMOVV
+				p.From.Type = obj.TYPE_MEM
+				p.From.Reg = REGSP
+			}
+		}
+
+		if p.To.Type == obj.TYPE_REG && p.To.Reg == REGSP && p.Spadj == 0 {
+			f := c.cursym.Func()
+			if f.FuncFlag&abi.FuncFlagSPWrite == 0 {
+				c.cursym.Func().FuncFlag |= abi.FuncFlagSPWrite
+				if ctxt.Debugvlog || !ctxt.IsAsm {
+					ctxt.Logf("auto-SPWRITE: %s %v\n", c.cursym.Name, p)
+					if !ctxt.IsAsm {
+						ctxt.Diag("invalid auto-SPWRITE in non-assembly")
+						ctxt.DiagFlush()
+						log.Fatalf("bad SPWRITE")
+					}
+				}
+			}
+		}
+	}
+}
+
+func (c *ctxt0) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
+	if c.ctxt.Flag_maymorestack != "" {
+		// Save LR and REGCTXT.
+		frameSize := 2 * c.ctxt.Arch.PtrSize
+
+		p = c.ctxt.StartUnsafePoint(p, c.newprog)
+
+		// Spill Arguments. This has to happen before we open
+		// any more frame space.
+		p = c.cursym.Func().SpillRegisterArgs(p, c.newprog)
+
+		// MOVV	REGLINK, -16(SP)
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVV
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = REGLINK
+		p.To.Type = obj.TYPE_MEM
+		p.To.Offset = int64(-frameSize)
+		p.To.Reg = REGSP
+
+		// MOVV	REGCTXT, -8(SP)
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVV
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = REGCTXT
+		p.To.Type = obj.TYPE_MEM
+		p.To.Offset = -int64(c.ctxt.Arch.PtrSize)
+		p.To.Reg = REGSP
+
+		// ADDV	$-16, SP
+		p = obj.Appendp(p, c.newprog)
+		p.As = AADDV
+		p.From.Type = obj.TYPE_CONST
+		p.From.Offset = int64(-frameSize)
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = REGSP
+		p.Spadj = int32(frameSize)
+
+		// JAL	maymorestack
+		p = obj.Appendp(p, c.newprog)
+		p.As = AJAL
+		p.To.Type = obj.TYPE_BRANCH
+		// See ../x86/obj6.go
+		p.To.Sym = c.ctxt.LookupABI(c.ctxt.Flag_maymorestack, c.cursym.ABI())
+
+		// Restore LR and REGCTXT.
+
+		// MOVV	0(SP), REGLINK
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVV
+		p.From.Type = obj.TYPE_MEM
+		p.From.Offset = 0
+		p.From.Reg = REGSP
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = REGLINK
+
+		// MOVV	8(SP), REGCTXT
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVV
+		p.From.Type = obj.TYPE_MEM
+		p.From.Offset = int64(c.ctxt.Arch.PtrSize)
+		p.From.Reg = REGSP
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = REGCTXT
+
+		// ADDV	$16, SP
+		p = obj.Appendp(p, c.newprog)
+		p.As = AADDV
+		p.From.Type = obj.TYPE_CONST
+		p.From.Offset = int64(frameSize)
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = REGSP
+		p.Spadj = int32(-frameSize)
+
+		// Unspill arguments
+		p = c.cursym.Func().UnspillRegisterArgs(p, c.newprog)
+		p = c.ctxt.EndUnsafePoint(p, c.newprog, -1)
+	}
+
+	// Jump back to here after morestack returns.
+	startPred := p
+
+	// MOVV	g_stackguard(g), R20
+	p = obj.Appendp(p, c.newprog)
+	p.As = AMOVV
+	p.From.Type = obj.TYPE_MEM
+	p.From.Reg = REGG
+	p.From.Offset = 2 * int64(c.ctxt.Arch.PtrSize) // G.stackguard0
+	if c.cursym.CFunc() {
+		p.From.Offset = 3 * int64(c.ctxt.Arch.PtrSize) // G.stackguard1
+	}
+	p.To.Type = obj.TYPE_REG
+	p.To.Reg = REGRT1
+
+	// Mark the stack bound check and morestack call async nonpreemptible.
+	// If we get preempted here, when resumed the preemption request is
+	// cleared, but we'll still call morestack, which will double the stack
+	// unnecessarily. See issue #35470.
+	p = c.ctxt.StartUnsafePoint(p, c.newprog)
+
+	to_more0 := (*obj.Prog)(nil)
+	to_more1 := (*obj.Prog)(nil)
+
+	if framesize <= abi.StackSmall {
+		// small stack:
+		//	// if stackguard >= SP { goto morestack }
+		//	BGEU	stackguard, SP, label-of-call-to-morestack
+		p = obj.Appendp(p, c.newprog)
+		p.As = ABGEU
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = REGRT1
+		p.Reg = REGSP
+		p.To.Type = obj.TYPE_BRANCH
+		to_more0 = p
+	} else {
+		// large stack: SP-framesize < stackguard-StackSmall
+		offset := int64(framesize) - abi.StackSmall
+		if framesize > abi.StackBig {
+			// Such a large stack we need to protect against underflow.
+			// The runtime guarantees SP > objabi.StackBig, but
+			// framesize is large enough that SP-framesize may
+			// underflow, causing a direct comparison with the
+			// stack guard to incorrectly succeed. We explicitly
+			// guard against underflow.
+			//
+			//	// if $(framesize-StackSmall) > SP { goto morestack }
+			//	MOVV	$(framesize-StackSmall), REGRT2
+			//	BLTU	SP, REGRT2, label-of-call-to-morestack
+			p = obj.Appendp(p, c.newprog)
+			p.As = AMOVV
+			p.From.Type = obj.TYPE_CONST
+			p.From.Offset = offset
+			p.To.Type = obj.TYPE_REG
+			p.To.Reg = REGRT2
+
+			p = obj.Appendp(p, c.newprog)
+			p.As = ABLTU
+			p.From.Type = obj.TYPE_REG
+			p.From.Reg = REGSP
+			p.Reg = REGRT2
+			p.To.Type = obj.TYPE_BRANCH
+			to_more0 = p
+		}
+
+		// Check against the stack guard. We've ensured this won't underflow.
+		//
+		//	// if SP - (framesize-StackSmall) <= stackguard { goto morestack }
+		//	ADDV	$-(framesize-StackSmall), SP, RT2
+		//	BGEU	stackguard, RT2, label-of-call-to-morestack
+		if framesize > abi.StackBig {
+			p = obj.Appendp(p, c.newprog)
+			p.As = ASUBV
+			p.From.Type = obj.TYPE_REG
+			p.From.Reg = REGRT2
+			p.Reg = REGSP
+			p.To.Type = obj.TYPE_REG
+			p.To.Reg = REGRT2
+		} else {
+			p = obj.Appendp(p, c.newprog)
+			p.As = AADDV
+			p.From.Type = obj.TYPE_CONST
+			p.From.Offset = -offset
+			p.Reg = REGSP
+			p.To.Type = obj.TYPE_REG
+			p.To.Reg = REGRT2
+		}
+
+		p = obj.Appendp(p, c.newprog)
+		p.As = ABGEU
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = REGRT1
+		p.Reg = REGRT2
+		p.To.Type = obj.TYPE_BRANCH
+		to_more1 = p
+	}
+
+	end := c.ctxt.EndUnsafePoint(p, c.newprog, -1)
+
+	var last *obj.Prog
+	for last = c.cursym.Func().Text; last.Link != nil; last = last.Link {
+	}
+
+	// Now we are at the end of the function, but logically
+	// we are still in function prologue. We need to fix the
+	// SP data and PCDATA.
+	spfix := obj.Appendp(last, c.newprog)
+	spfix.As = obj.ANOP
+	spfix.Spadj = -framesize
+
+	pcdata := c.ctxt.EmitEntryStackMap(c.cursym, spfix, c.newprog)
+	pcdata = c.ctxt.StartUnsafePoint(pcdata, c.newprog)
+
+	if to_more0 != nil {
+		to_more0.To.SetTarget(pcdata)
+	}
+
+	if to_more1 != nil {
+		to_more1.To.SetTarget(pcdata)
+	}
+
+	p = c.cursym.Func().SpillRegisterArgs(pcdata, c.newprog)
+
+	// MOVV	LINK, R31
+	p = obj.Appendp(p, c.newprog)
+	p.As = AMOVV
+	p.From.Type = obj.TYPE_REG
+	p.From.Reg = REGLINK
+	p.To.Type = obj.TYPE_REG
+	p.To.Reg = REG_R31
+
+	// JAL	runtime.morestack(SB)
+	call := obj.Appendp(p, c.newprog)
+	call.As = AJAL
+	call.To.Type = obj.TYPE_BRANCH
+
+	morestack := "runtime.morestack"
+	if c.cursym.CFunc() {
+		morestack = "runtime.morestackc"
+	} else if !c.cursym.Func().Text.From.Sym.NeedCtxt() {
+		morestack = "runtime.morestack_noctxt"
+	}
+	call.To.Sym = c.ctxt.Lookup(morestack)
+
+	// The instructions which unspill regs should be preemptible.
+	pcdata = c.ctxt.EndUnsafePoint(call, c.newprog, -1)
+	unspill := c.cursym.Func().UnspillRegisterArgs(pcdata, c.newprog)
+
+	// JMP	start
+	jmp := obj.Appendp(unspill, c.newprog)
+	jmp.As = AJMP
+	jmp.To.Type = obj.TYPE_BRANCH
+	jmp.To.SetTarget(startPred.Link)
+	jmp.Spadj = +framesize
+
+	return end
+}
+
+var Linkloong64 = obj.LinkArch{
+	Arch:           sys.ArchLoong64,
+	Init:           buildop,
+	Preprocess:     preprocess,
+	Assemble:       span0,
+	Progedit:       progedit,
+	UnaryDst:       unaryDst,
+	DWARFRegisters: LOONG64DWARFRegisters,
+}
