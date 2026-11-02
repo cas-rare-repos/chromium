@@ -9,3 +9,4 @@ dotnet-runtime	https://github.com/dotnet/runtime.git	b4548da6edfce1996a1d6ffe152
 freebsd-src	https://github.com/freebsd/freebsd-src.git	584f44221f45c5c26ec2a2888a3815c6f34bfad0	47418	722946191
 rust	https://github.com/rust-lang/rust.git	4c46afa63688fb473618f9b3553d70b0c15a88eb	62197	227274085
 go	https://github.com/golang/go.git	babb75be8cd5a3b1cd1a34fd837225cbef659d10	11605	124171409
+kubernetes	https://github.com/kubernetes/kubernetes.git	c5bdf2219eea569d6b973d224822f2a56c63d007	18922	219010194
