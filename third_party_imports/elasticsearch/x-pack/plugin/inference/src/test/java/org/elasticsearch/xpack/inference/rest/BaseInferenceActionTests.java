@@ -1,0 +1,306 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.xpack.inference.rest;
+
+import org.apache.lucene.util.SetOnce;
+import org.elasticsearch.ElasticsearchStatusException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.inference.InferenceRequestMetadata;
+import org.elasticsearch.inference.InferenceRequestMetadata.Field;
+import org.elasticsearch.inference.TaskType;
+import org.elasticsearch.rest.RestChannel;
+import org.elasticsearch.rest.RestRequest;
+import org.elasticsearch.rest.RestRequestTests;
+import org.elasticsearch.rest.action.RestChunkedToXContentListener;
+import org.elasticsearch.tasks.Task;
+import org.elasticsearch.test.rest.FakeRestRequest;
+import org.elasticsearch.test.rest.RestActionTestCase;
+import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xpack.core.inference.InferenceContext;
+import org.elasticsearch.xpack.core.inference.InferenceContextTests;
+import org.elasticsearch.xpack.core.inference.action.BaseInferenceActionRequest;
+import org.elasticsearch.xpack.core.inference.action.InferenceAction;
+import org.elasticsearch.xpack.core.inference.action.InferenceActionProxy;
+import org.elasticsearch.xpack.core.inference.results.DenseEmbeddingByteResults;
+import org.junit.Before;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.function.Consumer;
+
+import static org.elasticsearch.rest.RestRequest.Method.POST;
+import static org.elasticsearch.xpack.core.inference.action.BaseInferenceActionRequest.TIMEOUT_NOT_DETERMINED;
+import static org.elasticsearch.xpack.core.inference.action.BaseInferenceActionRequest.getDefaultTimeoutForTaskType;
+import static org.elasticsearch.xpack.core.inference.action.BaseInferenceActionRequest.resolveTimeoutForTaskType;
+import static org.elasticsearch.xpack.inference.rest.BaseInferenceAction.parseParams;
+import static org.elasticsearch.xpack.inference.rest.BaseInferenceAction.parseTimeout;
+import static org.elasticsearch.xpack.inference.rest.Paths.INFERENCE_ID;
+import static org.elasticsearch.xpack.inference.rest.Paths.TASK_TYPE_OR_INFERENCE_ID;
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
+
+public class BaseInferenceActionTests extends RestActionTestCase {
+
+    @Before
+    public void setUpAction() {
+        controller().registerHandler(new BaseInferenceAction() {
+            @Override
+            protected boolean shouldStream() {
+                return false;
+            }
+
+            @Override
+            protected ActionListener<InferenceAction.Response> listener(RestChannel channel) {
+                return new RestChunkedToXContentListener<>(channel);
+            }
+
+            @Override
+            public String getName() {
+                return "base_inference_action";
+            }
+
+            @Override
+            public List<Route> routes() {
+                return List.of(new Route(POST, route("{task_type_or_id}")), new Route(POST, route("{task_type_or_id}/{inference_id}")));
+            }
+        });
+    }
+
+    private static String route(String param) {
+        return "_route/" + param;
+    }
+
+    public void testParseParams_ExtractsInferenceIdAndTaskType() {
+        var params = parseParams(
+            RestRequestTests.contentRestRequest("{}", Map.of(INFERENCE_ID, "id", TASK_TYPE_OR_INFERENCE_ID, TaskType.COMPLETION.toString()))
+        );
+        assertThat(params, is(new BaseInferenceAction.Params("id", TaskType.COMPLETION)));
+    }
+
+    public void testParseParams_DefaultsToTaskTypeAny_WhenInferenceId_IsMissing() {
+        var params = parseParams(
+            RestRequestTests.contentRestRequest("{}", Map.of(TASK_TYPE_OR_INFERENCE_ID, TaskType.COMPLETION.toString()))
+        );
+        assertThat(params, is(new BaseInferenceAction.Params("completion", TaskType.ANY)));
+    }
+
+    public void testParseParams_ThrowsStatusException_WhenTaskTypeIsMissing() {
+        var e = expectThrows(
+            ElasticsearchStatusException.class,
+            () -> parseParams(RestRequestTests.contentRestRequest("{}", Map.of(INFERENCE_ID, "id")))
+        );
+        assertThat(e.getMessage(), is("Task type must not be null"));
+    }
+
+    public void testParseTimeout_ReturnsTimeout() {
+        var timeout = parseTimeout(
+            RestRequestTests.contentRestRequest("{}", Map.of(InferenceAction.Request.TIMEOUT.getPreferredName(), "4s"))
+        );
+
+        assertThat(timeout, is(TimeValue.timeValueSeconds(4)));
+    }
+
+    public void testParseTimeout_TimeoutNotSpecified_ReturnsPlaceholderTimeout() {
+        var timeout = parseTimeout(RestRequestTests.contentRestRequest("{}", Map.of()));
+
+        assertThat(timeout, is(TIMEOUT_NOT_DETERMINED));
+    }
+
+    public void testUsesUndeterminedTimeout_WhenTimeoutIsNotSpecified() {
+        SetOnce<Boolean> executeCalled = new SetOnce<>();
+        verifyingClient.setExecuteVerifier(((actionType, actionRequest) -> {
+            assertThat(actionRequest, instanceOf(InferenceActionProxy.Request.class));
+
+            var request = (InferenceActionProxy.Request) actionRequest;
+            assertThat(request.getTimeout(), is(BaseInferenceActionRequest.TIMEOUT_NOT_DETERMINED));
+
+            executeCalled.set(true);
+            return createResponse();
+        }));
+
+        RestRequest inferenceRequest = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.POST)
+            .withPath(route("test"))
+            .withContent(new BytesArray("{}"), XContentType.JSON)
+            .build();
+        dispatchRequest(inferenceRequest);
+        assertThat(executeCalled.get(), equalTo(true));
+    }
+
+    public void testUses3SecondTimeoutFromParams() {
+        SetOnce<Boolean> executeCalled = new SetOnce<>();
+        verifyingClient.setExecuteVerifier(((actionType, actionRequest) -> {
+            assertThat(actionRequest, instanceOf(InferenceActionProxy.Request.class));
+
+            var request = (InferenceActionProxy.Request) actionRequest;
+            assertThat(request.getTimeout(), is(TimeValue.timeValueSeconds(3)));
+
+            executeCalled.set(true);
+            return createResponse();
+        }));
+
+        RestRequest inferenceRequest = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.POST)
+            .withPath(route("test"))
+            .withParams(new HashMap<>(Map.of("timeout", "3s")))
+            .withContent(new BytesArray("{}"), XContentType.JSON)
+            .build();
+        dispatchRequest(inferenceRequest);
+        assertThat(executeCalled.get(), equalTo(true));
+    }
+
+    public void testExtractAttributionHeaders() {
+        assertExtractedHeaders(
+            Map.of(
+                "X-elastic-product-use-case",
+                List.of("product-use-case"),
+                "X-elastic-product-solution",
+                List.of("security"),
+                "X-elastic-product-feature",
+                List.of("attack_discovery"),
+                "X-Elastic-Inference-Interaction-Id",
+                List.of("interaction-id"),
+                "X-Elastic-Trace-Id",
+                List.of("trace-id"),
+                "X-Elastic-User-Id",
+                List.of("user-id"),
+                "X-Elastic-Space-Id",
+                List.of("space-id")
+            ),
+            context -> assertThat(
+                context,
+                equalTo(
+                    InferenceContextTests.context(
+                        "product-use-case",
+                        "security",
+                        "attack_discovery",
+                        "interaction-id",
+                        "trace-id",
+                        "user-id",
+                        "space-id"
+                    )
+                )
+            )
+        );
+    }
+
+    public void testExtractAttributionHeaders_EmptyWhenHeadersMissing() {
+        assertExtractedHeaders(Map.of(), context -> assertThat(context, equalTo(InferenceContext.EMPTY_INSTANCE)));
+    }
+
+    public void testExtractAttributionHeaders_EmptyWhenHeaderValuesEmpty() {
+        assertExtractedHeaders(
+            Map.of(
+                "X-elastic-product-use-case",
+                List.of(""),
+                "X-Elastic-Inference-Interaction-Id",
+                List.of(""),
+                "X-elastic-product-solution",
+                List.of(""),
+                "X-elastic-product-feature",
+                List.of("")
+            ),
+            context -> assertThat(context, equalTo(InferenceContext.EMPTY_INSTANCE))
+        );
+    }
+
+    public void testExtractAttributionHeaders_RepeatedUseCaseKeepsFirstValue() {
+        assertExtractedHeaders(
+            Map.of("X-elastic-product-use-case", List.of("first", "second")),
+            context -> assertThat(context, equalTo(new InferenceContext("first")))
+        );
+    }
+
+    public void testExtractAttributionHeaders_HeaderNameCasingIsIgnoredAndValueCasingIsKept() {
+        for (var field : InferenceContext.WIRE_LAYOUT) {
+            var name = field.httpHeader();
+            for (var spelling : List.of(name.toLowerCase(Locale.ROOT), name.toUpperCase(Locale.ROOT), alternateCase(name))) {
+                assertExtractedHeaders(
+                    Map.of(spelling, List.of("Mixed-Case Value")),
+                    context -> assertThat(
+                        spelling,
+                        context,
+                        equalTo(new InferenceContext(InferenceRequestMetadata.builder().put(field, "Mixed-Case Value").build()))
+                    )
+                );
+            }
+        }
+    }
+
+    public void testExtractAttributionHeaders_ProductOriginIsNotCaptured() {
+        assertExtractedHeaders(
+            Map.of(Task.X_ELASTIC_PRODUCT_ORIGIN_HTTP_HEADER, List.of("kibana"), "X-elastic-product-use-case", List.of("use-case")),
+            context -> {
+                assertThat(context, equalTo(new InferenceContext("use-case")));
+                assertThat(context.metadata().get(Field.PRODUCT_ORIGIN), nullValue());
+            }
+        );
+    }
+
+    private static String alternateCase(String value) {
+        var builder = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            var c = value.charAt(i);
+            builder.append(i % 2 == 0 ? Character.toLowerCase(c) : Character.toUpperCase(c));
+        }
+        return builder.toString();
+    }
+
+    private void assertExtractedHeaders(Map<String, List<String>> headers, Consumer<InferenceContext> assertion) {
+        SetOnce<Boolean> executeCalled = new SetOnce<>();
+
+        verifyingClient.setExecuteVerifier(((actionType, actionRequest) -> {
+            assertion.accept(((InferenceActionProxy.Request) actionRequest).getContext());
+            executeCalled.set(true);
+            return createResponse();
+        }));
+
+        dispatchRequest(
+            new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.POST)
+                .withPath(route("test"))
+                .withHeaders(new HashMap<>(headers))
+                .withContent(new BytesArray("{}"), XContentType.JSON)
+                .build()
+        );
+        assertThat(executeCalled.get(), equalTo(true));
+    }
+
+    public void testResolveTimeoutForTaskType_NullTimeout_ReturnsDefault() {
+        assertThat(resolveTimeoutForTaskType(TaskType.TEXT_EMBEDDING, null), is(TimeValue.timeValueSeconds(30)));
+        assertThat(resolveTimeoutForTaskType(TaskType.EMBEDDING, null), is(TimeValue.timeValueSeconds(30)));
+        assertThat(resolveTimeoutForTaskType(TaskType.SPARSE_EMBEDDING, null), is(TimeValue.timeValueSeconds(30)));
+        assertThat(resolveTimeoutForTaskType(TaskType.RERANK, null), is(TimeValue.timeValueSeconds(30)));
+        assertThat(resolveTimeoutForTaskType(TaskType.COMPLETION, null), is(TimeValue.timeValueSeconds(120)));
+        assertThat(resolveTimeoutForTaskType(TaskType.CHAT_COMPLETION, null), is(TimeValue.timeValueSeconds(120)));
+        assertThat(resolveTimeoutForTaskType(TaskType.ANY, null), is(TIMEOUT_NOT_DETERMINED));
+    }
+
+    public void testResolveTimeoutForTaskType_NonNullTimeout_ReturnsTimeout() {
+        var timeout = randomTimeValue(1, 1000);
+        for (TaskType taskType : TaskType.values()) {
+            assertThat(resolveTimeoutForTaskType(taskType, timeout), is(timeout));
+        }
+    }
+
+    public void testGetDefaultTimeoutForTaskType_ReturnsNonNull() {
+        for (TaskType taskType : TaskType.values()) {
+            assertThat(getDefaultTimeoutForTaskType(taskType), not(nullValue()));
+        }
+    }
+
+    static InferenceAction.Response createResponse() {
+        return new InferenceAction.Response(
+            new DenseEmbeddingByteResults(List.of(new DenseEmbeddingByteResults.Embedding(new byte[] { (byte) -1 })))
+        );
+    }
+}

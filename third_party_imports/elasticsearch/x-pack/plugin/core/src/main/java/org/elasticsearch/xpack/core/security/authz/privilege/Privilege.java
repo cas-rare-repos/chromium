@@ -1,0 +1,143 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+package org.elasticsearch.xpack.core.security.authz.privilege;
+
+import org.apache.lucene.util.Accountable;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.automaton.Automaton;
+import org.apache.lucene.util.automaton.Operations;
+import org.elasticsearch.common.util.CachedSupplier;
+import org.elasticsearch.common.util.Maps;
+import org.elasticsearch.xpack.core.security.support.Automatons;
+
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+import static org.elasticsearch.xpack.core.security.support.Automatons.patterns;
+
+public class Privilege implements Accountable {
+
+    // Avoid reflecting over the same class hierarchy for every newly resolved privilege.
+    private static final ClassValue<Long> SHALLOW_SIZES = new ClassValue<>() {
+        @Override
+        protected Long computeValue(Class<?> type) {
+            return RamUsageEstimator.shallowSizeOfInstance(type);
+        }
+    };
+
+    private static final long GRANTS_ALL_SIZE = RamUsageEstimator.shallowSizeOfInstance(CachedSupplier.class) + RamUsageEstimator
+        .alignObjectSize(RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + RamUsageEstimator.NUM_BYTES_OBJECT_REF);
+
+    public static final Privilege NONE = new Privilege(Collections.singleton("none"), Automatons.EMPTY);
+    public static final Privilege ALL = new Privilege(Collections.singleton("all"), Automatons.MATCH_ALL);
+
+    protected final Set<String> name;
+    protected final Automaton automaton;
+    protected final Predicate<String> predicate;
+    protected final Supplier<Boolean> grantsAll;
+
+    public Privilege(String name, String... patterns) {
+        this(Collections.singleton(name), patterns);
+    }
+
+    public Privilege(Set<String> name, String... patterns) {
+        this(name, patterns(patterns));
+    }
+
+    public Privilege(Set<String> name, Automaton automaton) {
+        this.name = name;
+        this.automaton = automaton;
+        this.predicate = Automatons.predicate(automaton);
+        this.grantsAll = CachedSupplier.wrap(() -> Operations.isTotal(automaton));
+    }
+
+    public Set<String> name() {
+        return name;
+    }
+
+    public Predicate<String> predicate() {
+        return predicate;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        Privilege privilege = (Privilege) o;
+
+        return Objects.equals(name, privilege.name);
+    }
+
+    @Override
+    public int hashCode() {
+        return name != null ? name.hashCode() : 0;
+    }
+
+    static String actionToPattern(String text) {
+        return text + "*";
+    }
+
+    @Override
+    public String toString() {
+        return name.toString();
+    }
+
+    public Automaton getAutomaton() {
+        return automaton;
+    }
+
+    /**
+     * Returns true if this privilege grants all names.
+     */
+    public boolean grantsAll() {
+        return grantsAll.get();
+    }
+
+    /**
+     * Estimates the heap retained by this privilege: the object itself, its names, its predicate and its {@code grantsAll} supplier. The
+     * automaton is not added separately because the predicate already includes it. The run automaton that evaluates the predicate
+     * references the same {@link Automaton} object as {@link #automaton} and counts it in its own size, see
+     * {@link Automatons#predicate(Automaton)}. Adding the automaton here would count it twice.
+     * <p>
+     * The shallow size is cached per runtime class, so the fields a subclass declares are included. A subclass whose fields reference
+     * objects it owns must override this method and add them.
+     */
+    @Override
+    public long ramBytesUsed() {
+        return SHALLOW_SIZES.get(getClass()) + GRANTS_ALL_SIZE + RamUsageEstimator.sizeOfObject(predicate) + RamUsageEstimator
+            .sizeOfCollection(name);
+    }
+
+    /**
+     * Sorts the map of privileges from least-privilege to most-privilege
+     */
+    public static <T extends Privilege> SortedMap<String, T> sortByAccessLevel(Map<String, T> privileges) {
+        // How many other privileges is this privilege a subset of. Those with a higher count are considered to be a lower privilege
+        final Map<String, Long> subsetCount = Maps.newMapWithExpectedSize(privileges.size());
+        privileges.forEach(
+            (name, priv) -> subsetCount.put(
+                name,
+                privileges.values().stream().filter(p2 -> p2 != priv && Automatons.subsetOf(priv.automaton, p2.automaton)).count()
+            )
+        );
+
+        final Comparator<String> compare = Comparator.<String>comparingLong(key -> subsetCount.getOrDefault(key, 0L))
+            .reversed()
+            .thenComparing(Comparator.naturalOrder());
+        final TreeMap<String, T> tree = new TreeMap<>(compare);
+        tree.putAll(privileges);
+        return Collections.unmodifiableSortedMap(tree);
+    }
+}

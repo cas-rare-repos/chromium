@@ -1,0 +1,1689 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.index.mapper;
+
+import org.apache.lucene.document.column.Column;
+import org.apache.lucene.document.column.LongColumn;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.DocValuesType;
+import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.MockPageCacheRecycler;
+import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.index.IndexMode;
+import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.index.IndexVersions;
+import org.elasticsearch.index.engine.EngineTestCase;
+import org.elasticsearch.index.engine.IndexOperationBatch;
+import org.elasticsearch.index.fieldvisitor.LeafStoredFieldLoader;
+import org.elasticsearch.index.fieldvisitor.StoredFieldLoader;
+import org.elasticsearch.search.lookup.Source;
+import org.elasticsearch.search.lookup.SourceFilter;
+import org.elasticsearch.sourcebatch.MappedColumns;
+import org.elasticsearch.test.index.IndexVersionUtils;
+import org.elasticsearch.transport.BytesRefRecycler;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentFactory;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xcontent.json.JsonXContent;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.stream.IntStream;
+
+import static org.elasticsearch.indices.recovery.RecoverySettings.INDICES_RECOVERY_SOURCE_ENABLED_SETTING;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
+
+public class SourceFieldMapperTests extends MetadataMapperTestCase {
+
+    @Override
+    protected String fieldName() {
+        return SourceFieldMapper.NAME;
+    }
+
+    @Override
+    protected boolean isConfigurable() {
+        return true;
+    }
+
+    @Override
+    protected void registerParameters(ParameterChecker checker) throws IOException {
+        checker.registerConflictCheck(
+            "enabled",
+            topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", false).endObject()),
+            topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", true).endObject()),
+            dm -> {}
+        );
+        checker.registerUpdateCheck(
+            "enabled",
+            topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", true).endObject()),
+            topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", false).endObject()),
+            dm -> assertFalse(dm.metadataMapper(SourceFieldMapper.class).enabled())
+        );
+        checker.registerUpdateCheck(
+            "mode",
+            topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("mode", "stored").endObject()),
+            topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("mode", "synthetic").endObject()),
+            dm -> {}
+        );
+        // mode is controlled by index settings on current index versions rather than serialized in the mapping
+        checker.excludeFromSerialization("mode");
+        checker.registerConflictCheck("includes", b -> b.array("includes", "foo*"));
+        checker.registerConflictCheck("excludes", b -> b.array("excludes", "foo*"));
+    }
+
+    public void testNoFormat() throws Exception {
+
+        DocumentMapper documentMapper = createDocumentMapper(topMapping(b -> b.startObject("_source").endObject()));
+        ParsedDocument doc = documentMapper.parse(
+            new SourceToParse(
+                "1",
+                BytesReference.bytes(XContentFactory.jsonBuilder().startObject().field("field", "value").endObject()),
+                XContentType.JSON
+            )
+        );
+
+        assertThat(XContentHelper.xContentType(doc.source().originalBytes()), equalTo(XContentType.JSON));
+
+        doc = documentMapper.parse(
+            new SourceToParse(
+                "1",
+                BytesReference.bytes(XContentFactory.smileBuilder().startObject().field("field", "value").endObject()),
+                XContentType.SMILE
+            )
+        );
+
+        assertThat(XContentHelper.xContentType(doc.source().originalBytes()), equalTo(XContentType.SMILE));
+    }
+
+    public void testIncludes() throws Exception {
+        DocumentMapper documentMapper = createDocumentMapper(
+            topMapping(b -> b.startObject("_source").array("includes", "path1*").endObject())
+        );
+
+        ParsedDocument doc = documentMapper.parse(source(b -> {
+            b.startObject("path1").field("field1", "value1").endObject();
+            b.startObject("path2").field("field2", "value2").endObject();
+        }));
+
+        IndexableField sourceField = doc.rootDoc().getField("_source");
+        Map<String, Object> sourceAsMap;
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, new BytesArray(sourceField.binaryValue()))) {
+            sourceAsMap = parser.map();
+        }
+        assertThat(sourceAsMap.containsKey("path1"), equalTo(true));
+        assertThat(sourceAsMap.containsKey("path2"), equalTo(false));
+    }
+
+    public void testDuplicatedIncludes() throws Exception {
+        DocumentMapper documentMapper = createDocumentMapper(
+            topMapping(b -> b.startObject("_source").array("includes", "path1", "path1").endObject())
+        );
+
+        ParsedDocument doc = documentMapper.parse(source(b -> {
+            b.startObject("path1").field("field1", "value1").endObject();
+            b.startObject("path2").field("field2", "value2").endObject();
+        }));
+
+        IndexableField sourceField = doc.rootDoc().getField("_source");
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, new BytesArray(sourceField.binaryValue()))) {
+            assertEquals(Map.of("path1", Map.of("field1", "value1")), parser.map());
+        }
+    }
+
+    public void testExcludes() throws Exception {
+        DocumentMapper documentMapper = createDocumentMapper(
+            topMapping(b -> b.startObject("_source").array("excludes", "path1*").endObject())
+        );
+
+        ParsedDocument doc = documentMapper.parse(source(b -> {
+            b.startObject("path1").field("field1", "value1").endObject();
+            b.startObject("path2").field("field2", "value2").endObject();
+        }));
+
+        IndexableField sourceField = doc.rootDoc().getField("_source");
+        Map<String, Object> sourceAsMap;
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, new BytesArray(sourceField.binaryValue()))) {
+            sourceAsMap = parser.map();
+        }
+        assertThat(sourceAsMap.containsKey("path1"), equalTo(false));
+        assertThat(sourceAsMap.containsKey("path2"), equalTo(true));
+    }
+
+    public void testDuplicatedExcludes() throws Exception {
+        DocumentMapper documentMapper = createDocumentMapper(
+            topMapping(b -> b.startObject("_source").array("excludes", "path1", "path1").endObject())
+        );
+
+        ParsedDocument doc = documentMapper.parse(source(b -> {
+            b.startObject("path1").field("field1", "value1").endObject();
+            b.startObject("path2").field("field2", "value2").endObject();
+        }));
+
+        IndexableField sourceField = doc.rootDoc().getField("_source");
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, new BytesArray(sourceField.binaryValue()))) {
+            assertEquals(Map.of("path2", Map.of("field2", "value2")), parser.map());
+        }
+    }
+
+    public void testComplete() throws Exception {
+
+        assertTrue(createDocumentMapper(topMapping(b -> {})).sourceMapper().isComplete());
+
+        assertFalse(
+            createDocumentMapper(topMapping(b -> b.startObject("_source").field("enabled", false).endObject())).sourceMapper().isComplete()
+        );
+
+        assertFalse(
+            createDocumentMapper(topMapping(b -> b.startObject("_source").array("includes", "foo*").endObject())).sourceMapper()
+                .isComplete()
+        );
+
+        assertFalse(
+            createDocumentMapper(topMapping(b -> b.startObject("_source").array("excludes", "foo*").endObject())).sourceMapper()
+                .isComplete()
+        );
+    }
+
+    public void testSourceObjectContainsExtraTokens() throws Exception {
+        DocumentMapper documentMapper = createDocumentMapper(mapping(b -> {}));
+
+        Exception exception = expectThrows(
+            DocumentParsingException.class,
+            // extra end object (invalid JSON))
+            () -> documentMapper.parse(new SourceToParse("1", new BytesArray("{}}"), XContentType.JSON))
+        );
+        assertNotNull(exception.getCause());
+        assertThat(exception.getCause().getMessage(), containsString("Unexpected close marker '}'"));
+    }
+
+    public void testSyntheticDisabledNotSupported() {
+        Exception e = expectThrows(
+            MapperParsingException.class,
+            () -> createDocumentMapper(
+                topMapping(b -> b.startObject("_source").field("enabled", false).field("mode", "synthetic").endObject())
+            )
+        );
+        assertThat(e.getMessage(), containsString("Cannot set both [mode] and [enabled] parameters"));
+    }
+
+    public void testSyntheticUpdates() throws Exception {
+        MapperService mapperService = createMapperService("""
+            { "_doc" : { "_source" : { "mode" : "synthetic" } } }
+            """);
+        SourceFieldMapper mapper = mapperService.documentMapper().sourceMapper();
+        assertTrue(mapper.enabled());
+        assertFalse("mode is a noop parameter", mapper.isSynthetic());
+
+        merge(mapperService, """
+            { "_doc" : { "_source" : { "mode" : "synthetic" } } }
+            """);
+        mapper = mapperService.documentMapper().sourceMapper();
+        assertTrue(mapper.enabled());
+        assertFalse("mode is a noop parameter", mapper.isSynthetic());
+
+        ParsedDocument doc = mapperService.documentMapper().parse(source("{}"));
+        assertNull(doc.rootDoc().get(SourceFieldMapper.NAME));
+
+        merge(mapperService, """
+            { "_doc" : { "_source" : { "mode" : "disabled" } } }
+            """);
+
+        mapper = mapperService.documentMapper().sourceMapper();
+        assertTrue("mode is a noop parameter", mapper.enabled());
+        assertFalse("mode is a noop parameter", mapper.isSynthetic());
+    }
+
+    public void testSyntheticUpdatesLegacy() throws Exception {
+        var mappings = XContentBuilder.builder(XContentType.JSON.xContent()).startObject().startObject("_doc").startObject("_source");
+        mappings.field("mode", "synthetic").endObject().endObject().endObject();
+        var version = IndexVersionUtils.getPreviousVersion(IndexVersions.SOURCE_MAPPER_MODE_ATTRIBUTE_NOOP);
+        MapperService mapperService = createMapperService(version, mappings);
+        SourceFieldMapper mapper = mapperService.documentMapper().sourceMapper();
+        assertTrue(mapper.enabled());
+        assertTrue(mapper.isSynthetic());
+
+        merge(mapperService, """
+            { "_doc" : { "_source" : { "mode" : "synthetic" } } }
+            """);
+        mapper = mapperService.documentMapper().sourceMapper();
+        assertTrue(mapper.enabled());
+        assertTrue(mapper.isSynthetic());
+
+        ParsedDocument doc = mapperService.documentMapper().parse(source("{}"));
+        assertNull(doc.rootDoc().get(SourceFieldMapper.NAME));
+
+        merge(mapperService, """
+            { "_doc" : { "_source" : { "mode" : "disabled" } } }
+            """);
+
+        mapper = mapperService.documentMapper().sourceMapper();
+        assertFalse(mapper.enabled());
+        assertFalse(mapper.isSynthetic());
+    }
+
+    public void testSyntheticSourceInTimeSeries() throws IOException {
+        XContentBuilder mapping = fieldMapping(b -> {
+            b.field("type", "keyword");
+            b.field("time_series_dimension", true);
+        });
+        DocumentMapper mapper = createTimeSeriesModeDocumentMapper(mapping);
+        assertTrue(mapper.sourceMapper().isSynthetic());
+        assertEquals("{}", mapper.sourceMapper().toString());
+    }
+
+    public void testSyntheticSourceWithLogsIndexMode() throws IOException {
+        XContentBuilder mapping = fieldMapping(b -> { b.field("type", "keyword"); });
+        DocumentMapper mapper = createLogsModeDocumentMapper(mapping);
+        assertTrue(mapper.sourceMapper().isSynthetic());
+        assertEquals("{}", mapper.sourceMapper().toString());
+    }
+
+    public void testSyntheticSourceWithColumnarIndexMode() throws IOException {
+        XContentBuilder mapping = fieldMapping(b -> { b.field("type", "keyword"); });
+        DocumentMapper mapper = createColumnarModeDocumentMapper(mapping);
+        assertTrue(mapper.sourceMapper().isSynthetic());
+        assertEquals("{}", mapper.sourceMapper().toString());
+    }
+
+    public void testSyntheticSourceWithColumnarLogsdbIndexMode() throws IOException {
+        XContentBuilder mapping = fieldMapping(b -> { b.field("type", "keyword"); });
+        DocumentMapper mapper = createColumnarLogsdbModeDocumentMapper(mapping);
+        assertTrue(mapper.sourceMapper().isSynthetic());
+        assertEquals("{}", mapper.sourceMapper().toString());
+    }
+
+    public void testSupportsNonDefaultParameterValues() throws IOException {
+        Settings settings = Settings.builder().put(SourceFieldMapper.LOSSY_PARAMETERS_ALLOWED_SETTING_NAME, false).build();
+        {
+            var sourceFieldMapper = createMapperService(settings, topMapping(b -> b.startObject("_source").endObject())).documentMapper()
+                .sourceMapper();
+            assertThat(sourceFieldMapper, notNullValue());
+        }
+        {
+            var sourceFieldMapper = createMapperService(
+                settings,
+                topMapping(b -> b.startObject("_source").field("mode", randomBoolean() ? "synthetic" : "stored").endObject())
+            ).documentMapper().sourceMapper();
+            assertThat(sourceFieldMapper, notNullValue());
+        }
+        Exception e = expectThrows(
+            MapperParsingException.class,
+            () -> createMapperService(settings, topMapping(b -> b.startObject("_source").field("enabled", false).endObject()))
+                .documentMapper()
+                .sourceMapper()
+        );
+        assertThat(e.getMessage(), containsString("Parameter [enabled] is not allowed in source"));
+
+        e = expectThrows(
+            MapperParsingException.class,
+            () -> createMapperService(settings, topMapping(b -> b.startObject("_source").array("includes", "foo").endObject()))
+                .documentMapper()
+                .sourceMapper()
+        );
+        assertThat(e.getMessage(), containsString("Parameter [includes] is not allowed in source"));
+
+        e = expectThrows(
+            MapperParsingException.class,
+            () -> createMapperService(settings, topMapping(b -> b.startObject("_source").array("excludes", "foo").endObject()))
+                .documentMapper()
+                .sourceMapper()
+        );
+        assertThat(e.getMessage(), containsString("Parameter [excludes] is not allowed in source"));
+
+        e = expectThrows(
+            MapperParsingException.class,
+            () -> createMapperService(settings, topMapping(b -> b.startObject("_source").field("mode", "disabled").endObject()))
+                .documentMapper()
+                .sourceMapper()
+        );
+        assertThat(e.getMessage(), containsString("Parameter [mode=disabled] is not allowed in source"));
+
+        e = expectThrows(
+            MapperParsingException.class,
+            () -> createMapperService(
+                settings,
+                topMapping(
+                    b -> b.startObject("_source").field("enabled", false).array("includes", "foo").array("excludes", "foo").endObject()
+                )
+            ).documentMapper().sourceMapper()
+        );
+        assertThat(e.getMessage(), containsString("Parameters [enabled,includes,excludes] are not allowed in source"));
+    }
+
+    public void testBypassCheckForNonDefaultParameterValuesInEarlierVersions() throws IOException {
+        Settings settings = Settings.builder().put(SourceFieldMapper.LOSSY_PARAMETERS_ALLOWED_SETTING_NAME, false).build();
+        {
+            var sourceFieldMapper = createMapperService(
+                IndexVersionUtils.getPreviousVersion(IndexVersions.SOURCE_MAPPER_LOSSY_PARAMS_CHECK),
+                settings,
+                () -> true,
+                topMapping(b -> b.startObject("_source").field("enabled", false).endObject())
+            ).documentMapper().sourceMapper();
+            assertThat(sourceFieldMapper, notNullValue());
+        }
+        {
+            var sourceFieldMapper = createMapperService(
+                IndexVersionUtils.getPreviousVersion(IndexVersions.SOURCE_MAPPER_LOSSY_PARAMS_CHECK),
+                settings,
+                () -> true,
+                topMapping(b -> b.startObject("_source").array("includes", "foo").endObject())
+            ).documentMapper().sourceMapper();
+            assertThat(sourceFieldMapper, notNullValue());
+        }
+        {
+            var sourceFieldMapper = createMapperService(
+                IndexVersionUtils.getPreviousVersion(IndexVersions.SOURCE_MAPPER_LOSSY_PARAMS_CHECK),
+                settings,
+                () -> true,
+                topMapping(b -> b.startObject("_source").array("excludes", "foo").endObject())
+            ).documentMapper().sourceMapper();
+            assertThat(sourceFieldMapper, notNullValue());
+        }
+        {
+            var sourceFieldMapper = createMapperService(
+                IndexVersionUtils.getPreviousVersion(IndexVersions.SOURCE_MAPPER_LOSSY_PARAMS_CHECK),
+                settings,
+                () -> true,
+                topMapping(b -> b.startObject("_source").field("mode", "disabled").endObject())
+            ).documentMapper().sourceMapper();
+            assertThat(sourceFieldMapper, notNullValue());
+        }
+    }
+
+    public void testRecoverySourceWithSourceExcludes() throws IOException {
+        {
+            MapperService mapperService = createMapperService(
+                topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("excludes", List.of("field1")).endObject())
+            );
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("field1", "value1"); }));
+
+            assertNotNull(doc.rootDoc().getField("_recovery_source"));
+            assertThat(doc.rootDoc().getField("_recovery_source").binaryValue(), equalTo(new BytesRef("{\"field1\":\"value1\"}")));
+        }
+        {
+            Settings settings = Settings.builder().put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false).build();
+            MapperService mapperService = createMapperService(
+                settings,
+                topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", false).endObject())
+            );
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWithSourceDisabled() throws IOException {
+        {
+            MapperService mapperService = createMapperService(
+                topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", false).endObject())
+            );
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("field1", "value1"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source"));
+            assertThat(doc.rootDoc().getField("_recovery_source").binaryValue(), equalTo(new BytesRef("{\"field1\":\"value1\"}")));
+        }
+        {
+            Settings settings = Settings.builder().put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false).build();
+            MapperService mapperService = createMapperService(
+                settings,
+                topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("enabled", false).endObject())
+            );
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWitInvalidSettings() {
+        {
+            Settings settings = Settings.builder().put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true).build();
+            IllegalArgumentException exc = expectThrows(
+                IllegalArgumentException.class,
+                () -> createMapperService(settings, topMapping(b -> {}))
+            );
+            assertThat(
+                exc.getMessage(),
+                containsString(
+                    String.format(
+                        Locale.ROOT,
+                        "The setting [%s] is only permitted",
+                        IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey()
+                    )
+                )
+            );
+        }
+
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED.toString())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                .build();
+            IllegalArgumentException exc = expectThrows(
+                IllegalArgumentException.class,
+                () -> createMapperService(settings, topMapping(b -> {}))
+            );
+            assertThat(
+                exc.getMessage(),
+                containsString(
+                    String.format(
+                        Locale.ROOT,
+                        "The setting [%s] is only permitted",
+                        IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey()
+                    )
+                )
+            );
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.STANDARD.toString())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                .build();
+            IllegalArgumentException exc = expectThrows(
+                IllegalArgumentException.class,
+                () -> createMapperService(settings, topMapping(b -> {}))
+            );
+            assertThat(
+                exc.getMessage(),
+                containsString(
+                    String.format(
+                        Locale.ROOT,
+                        "The setting [%s] is only permitted",
+                        IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey()
+                    )
+                )
+            );
+        }
+    }
+
+    public void testColumnarStoredModeRequiresColumnarIndex() {
+        // COLUMNAR_STORED is rejected on non-columnar index modes
+        for (var nonColumnarMode : new IndexMode[] { IndexMode.STANDARD, IndexMode.LOGSDB, IndexMode.TIME_SERIES }) {
+            Settings.Builder builder = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), nonColumnarMode.toString())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString());
+            if (nonColumnarMode == IndexMode.TIME_SERIES) {
+                // time_series requires a routing_path; provide one so its own validation passes and our source mode validator fires
+                builder.putList(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "dim");
+            }
+            Settings settings = builder.build();
+            IllegalArgumentException exc = expectThrows(
+                IllegalArgumentException.class,
+                () -> createMapperService(settings, topMapping(b -> {}))
+            );
+            assertThat(
+                exc.getMessage(),
+                containsString(
+                    "unsupported source mode [COLUMNAR_STORED] for index mode ["
+                        + nonColumnarMode
+                        + "]; supported values: [DISABLED, STORED, SYNTHETIC]"
+                )
+            );
+        }
+    }
+
+    public void testNonColumnarSourceModesRejectedInColumnarIndex() {
+        // DISABLED and STORED are rejected on columnar index modes (SYNTHETIC is allowed)
+        for (var columnarMode : Arrays.stream(IndexMode.availableModes()).filter(IndexMode::isStrictColumnar).toList()) {
+            for (var unsupportedMode : new SourceFieldMapper.Mode[] { SourceFieldMapper.Mode.DISABLED, SourceFieldMapper.Mode.STORED }) {
+                Settings settings = Settings.builder()
+                    .put(IndexSettings.MODE.getKey(), columnarMode.toString())
+                    .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), unsupportedMode.toString())
+                    .build();
+                IllegalArgumentException exc = expectThrows(
+                    IllegalArgumentException.class,
+                    () -> createMapperService(settings, topMapping(b -> {}))
+                );
+                assertThat(
+                    exc.getMessage(),
+                    containsString(
+                        "unsupported source mode ["
+                            + unsupportedMode
+                            + "] for index mode ["
+                            + columnarMode
+                            + "]; supported values: "
+                            + columnarMode.supportedSourceModes()
+                    )
+                );
+            }
+        }
+    }
+
+    public void testSyntheticRecoverySourceRequiredForColumnarIndex() {
+        // Disabling synthetic recovery source is rejected for columnar index modes
+        for (var columnarMode : Arrays.stream(IndexMode.availableModes()).filter(IndexMode::isStrictColumnar).toList()) {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), columnarMode.toString())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), false)
+                .build();
+            IllegalArgumentException exc = expectThrows(
+                IllegalArgumentException.class,
+                () -> createMapperService(settings, topMapping(b -> {}))
+            );
+            assertThat(
+                exc.getMessage(),
+                containsString(
+                    "The setting ["
+                        + IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey()
+                        + "] must not be false when ["
+                        + IndexSettings.MODE.getKey()
+                        + "] is set to ["
+                        + columnarMode.name()
+                        + "]."
+                )
+            );
+        }
+    }
+
+    public void testRecoverySourceWithSyntheticSource() throws IOException {
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC.toString())
+                .build();
+            MapperService mapperService = createMapperService(settings, topMapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC.toString())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                .build();
+            MapperService mapperService = createMapperService(settings, topMapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(19L));
+        }
+        {
+            Settings settings = Settings.builder().put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false).build();
+            MapperService mapperService = createMapperService(
+                settings,
+                topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("mode", "synthetic").endObject())
+            );
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWithColumnarStoredSource() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("field1");
+            b.field("type", "keyword");
+            b.endObject();
+        }));
+        DocumentMapper docMapper = mapperService.documentMapper();
+        ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+        // columnar_stored requires synthetic recovery source, so only the size is stored (not the full source)
+        assertNull(doc.rootDoc().getField("_recovery_source"));
+        assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+    }
+
+    public void testColumnarStoredSourceWithSkipIgnoredSourceWrite() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .put(IgnoredSourceFieldMapper.SKIP_IGNORED_SOURCE_WRITE_SETTING.getKey(), true)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("field1");
+            b.field("type", "keyword");
+            b.endObject();
+        }));
+        DocumentMapper docMapper = mapperService.documentMapper();
+        ParsedDocument doc = docMapper.parse(source(b -> b.field("field1", "value1")));
+        // columnar_stored always writes its whole-document _ignored_source entry, even
+        // when skip_ignored_source_write=true suppresses per-field entries
+        assertNotNull(doc.rootDoc().getField(IgnoredSourceFieldMapper.NAME));
+        // synthetic recovery source is required for columnar_stored, so only the size is stored
+        assertNull(doc.rootDoc().getField("_recovery_source"));
+        assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+    }
+
+    /**
+     * Verifies that in columnar_stored mode, the source loader reads from the pre-computed _ignored_source blob
+     * rather than reconstructing source from doc values.
+     */
+    public void testColumnarStoredSourceReadsFromIgnoredSourceBlob() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("kwd");
+            b.field("type", "keyword");
+            b.endObject();
+        }));
+
+        // Parse a document so postParse() stores {"kwd":"blob_value"} in the _ignored_source blob.
+        ParsedDocument parsed = mapperService.documentMapper().parse(source(b -> b.field("kwd", "blob_value")));
+
+        // Build a modified Lucene document: keep the _ignored_source blob but change kwd doc values to "docvalues_value".
+        List<IndexableField> modified = new ArrayList<>();
+        for (IndexableField field : parsed.rootDoc()) {
+            if (field instanceof MultiValuedBinaryDocValuesField && field.name().equals("kwd")) {
+                MultiValuedBinaryDocValuesField replacement = new ColumnarBinaryDocValuesField(
+                    "kwd",
+                    MultiValuedBinaryDocValuesField.ValueOrdering.UNSORTED
+                );
+                replacement.add(new BytesRef("docvalues_value"));
+                modified.add(replacement);
+            } else {
+                modified.add(field);
+            }
+        }
+
+        withLuceneIndex(mapperService, iw -> iw.addDocument(modified), reader -> {
+            SourceLoader loader = mapperService.mappingLookup().newSourceLoader(null, SourceFieldMetrics.NOOP, null);
+            for (LeafReaderContext leaf : reader.leaves()) {
+                int[] docIds = IntStream.range(0, leaf.reader().maxDoc()).toArray();
+                SourceLoader.Leaf sourceLeaf = loader.leaf(leaf, docIds);
+                LeafStoredFieldLoader sfLoader = StoredFieldLoader.create(false, loader.requiredStoredFields()).getLoader(leaf, docIds);
+                sfLoader.advanceTo(0);
+                Source source = sourceLeaf.source(sfLoader, 0);
+                // Source comes from the _ignored_source blob, not from kwd doc values
+                assertThat(source.internalSourceRef().utf8ToString(), equalTo("{\"kwd\":\"blob_value\"}"));
+            }
+        });
+    }
+
+    /**
+     * Verifies that in columnar_stored mode a filtered source loader returns the filtered blob. An include filter used to drop the
+     * whole-document {@code _ignored_source} entry by its name {@code _source}: the root then failed on the missing blob when an
+     * included field had a value, and returned {@code {}} when none had one (a text field without doc values reads its own value from
+     * {@code _source}).
+     */
+    public void testColumnarStoredSourceWithFilter() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("lng").field("type", "long").endObject();
+            b.startObject("kwd").field("type", "keyword").endObject();
+            b.startObject("txt").field("type", "text").field("doc_values", false).endObject();
+            b.startObject("p").field("type", "long");
+            {
+                b.startObject("fields").startObject("t").field("type", "text").field("doc_values", false).endObject().endObject();
+            }
+            b.endObject();
+            b.startObject("obj").startObject("properties");
+            {
+                b.startObject("sub").field("type", "keyword").endObject();
+            }
+            b.endObject().endObject();
+        }));
+        ParsedDocument parsed = mapperService.documentMapper()
+            .parse(
+                source(
+                    b -> b.field("lng", randomLong())
+                        .field("kwd", randomAlphaOfLengthBetween(1, 10))
+                        .field("txt", randomAlphaOfLengthBetween(1, 10))
+                        .field("p", randomLong())
+                        .startObject("obj")
+                        .field("sub", randomAlphaOfLengthBetween(1, 10))
+                        .endObject()
+                )
+            );
+
+        withLuceneIndex(mapperService, iw -> iw.addDocument(parsed.rootDoc()), reader -> {
+            LeafReaderContext leaf = getOnlyLeafReader(reader).getContext();
+            Source full = loadColumnarStoredSource(mapperService, leaf, null);
+            List<String[]> includes = new ArrayList<>();
+            for (String path : List.of("lng", "kwd", "txt", "p", "obj", "obj.sub", "missing")) {
+                includes.add(new String[] { path });
+            }
+            includes.add(randomSubsetOf(between(2, 4), "lng", "kwd", "txt", "p", "obj.sub").toArray(String[]::new));
+            for (String[] include : includes) {
+                SourceFilter filter = new SourceFilter(include, randomBoolean() ? null : new String[] { randomFrom("lng", "kwd") });
+                Source filtered = loadColumnarStoredSource(mapperService, leaf, filter);
+                assertThat(Arrays.toString(include), filtered.source(), equalTo(full.filter(filter).source()));
+            }
+        });
+    }
+
+    private static Source loadColumnarStoredSource(MapperService mapperService, LeafReaderContext leaf, SourceFilter filter)
+        throws IOException {
+        SourceLoader loader = mapperService.mappingLookup().newSourceLoader(filter, SourceFieldMetrics.NOOP, null);
+        int[] docIds = new int[] { 0 };
+        LeafStoredFieldLoader sfLoader = StoredFieldLoader.create(false, loader.requiredStoredFields()).getLoader(leaf, docIds);
+        sfLoader.advanceTo(0);
+        return loader.leaf(leaf, docIds).source(sfLoader, 0);
+    }
+
+    /**
+     * Verifies that synthetic source reads back right when documents with and without values in {@code _ignored_source} follow each
+     * other, as the source loader (and so the objects in it) is reused for all of them. A document with an ignored value has
+     * to merge it with the values of the other fields of its object, while one without can write its fields in the order of the
+     * mapping.
+     */
+    public void testSyntheticSourceWithAndWithoutIgnoredValuesInTurn() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC.toString())
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("a_plain").field("type", "keyword").endObject();
+            b.startObject("b_ignored").field("type", "keyword").field("ignore_above", 3).endObject();
+            b.startObject("z_id").field("type", "keyword").endObject();
+            b.startObject("obj");
+            {
+                b.startObject("properties");
+                b.startObject("c_plain").field("type", "keyword").endObject();
+                b.startObject("d_ignored").field("type", "keyword").field("ignore_above", 3).endObject();
+                b.startObject("e_num").field("type", "long").endObject();
+                b.endObject();
+            }
+            b.endObject();
+        }));
+
+        int numDocs = between(20, 50);
+        List<Map<String, Object>> expectedSources = new ArrayList<>();
+        List<ParsedDocument> parsedDocs = new ArrayList<>();
+        for (int i = 0; i < numDocs; i++) {
+            // The index may end up in several segments, and in any order, so every document says which one it is.
+            Map<String, Object> doc = new LinkedHashMap<>();
+            doc.put("z_id", Integer.toString(i));
+            Map<String, Object> obj = new LinkedHashMap<>();
+            if (randomBoolean()) {
+                doc.put("a_plain", randomAlphaOfLengthBetween(1, 3));
+            }
+            if (randomBoolean()) {
+                // Longer than ignore_above half of the time, which moves the value to _ignored_source.
+                doc.put("b_ignored", randomAlphaOfLengthBetween(1, 6));
+            }
+            if (randomBoolean()) {
+                obj.put("c_plain", randomAlphaOfLengthBetween(1, 3));
+            }
+            if (randomBoolean()) {
+                obj.put("d_ignored", randomAlphaOfLengthBetween(1, 6));
+            }
+            if (randomBoolean()) {
+                obj.put("e_num", randomIntBetween(0, 1000));
+            }
+            if (obj.isEmpty() == false) {
+                doc.put("obj", obj);
+            }
+            expectedSources.add(doc);
+            parsedDocs.add(mapperService.documentMapper().parse(source(b -> b.mapContents(doc))));
+        }
+
+        withLuceneIndex(mapperService, iw -> {
+            for (ParsedDocument parsed : parsedDocs) {
+                iw.addDocument(parsed.rootDoc());
+            }
+        }, reader -> {
+            SourceLoader loader = mapperService.mappingLookup().newSourceLoader(null, SourceFieldMetrics.NOOP, null);
+            int checked = 0;
+            for (LeafReaderContext leaf : reader.leaves()) {
+                int[] docIds = IntStream.range(0, leaf.reader().maxDoc()).toArray();
+                SourceLoader.Leaf sourceLeaf = loader.leaf(leaf, docIds);
+                LeafStoredFieldLoader sfLoader = StoredFieldLoader.create(false, loader.requiredStoredFields()).getLoader(leaf, docIds);
+                for (int docId : docIds) {
+                    sfLoader.advanceTo(docId);
+                    Map<String, Object> source = sourceLeaf.source(sfLoader, docId).source();
+                    int id = Integer.parseInt((String) source.get("z_id"));
+                    assertThat("doc " + id, source, equalTo(expectedSources.get(id)));
+                    checked++;
+                }
+            }
+            assertThat(checked, equalTo(numDocs));
+        });
+    }
+
+    /**
+     * Verifies that, in columnar_stored mode, nothing of one document leaks into the source blob of the next one. The source of every
+     * document is rebuilt with a source loader that is reused for all the documents a thread indexes, so this indexes documents with
+     * random subsets of the fields (single values, arrays, fields of an object, and values that end up in {@code _ignored_source} because
+     * of {@code ignore_above}) one after the other, and checks that each one reads back exactly as it was indexed.
+     */
+    public void testColumnarStoredSourceDoesNotLeakStateBetweenDocuments() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("kwd").field("type", "keyword").endObject();
+            b.startObject("ignored").field("type", "keyword").field("ignore_above", 3).endObject();
+            b.startObject("num").field("type", "long").endObject();
+            b.startObject("z_id").field("type", "keyword").endObject();
+            b.startObject("obj");
+            {
+                b.startObject("properties");
+                b.startObject("inner").field("type", "keyword").endObject();
+                b.startObject("inner_num").field("type", "long").endObject();
+                b.endObject();
+            }
+            b.endObject();
+        }));
+
+        int numDocs = between(20, 50);
+        List<Map<String, Object>> expectedSources = new ArrayList<>();
+        List<ParsedDocument> parsedDocs = new ArrayList<>();
+        for (int i = 0; i < numDocs; i++) {
+            // The index may end up in several segments, and in any order, so every document says which one it is.
+            Map<String, Object> doc = new LinkedHashMap<>();
+            doc.put("z_id", Integer.toString(i));
+            if (randomBoolean()) {
+                doc.put("kwd", randomKeywords(1, 6));
+            }
+            if (randomBoolean()) {
+                doc.put("ignored", randomKeywords(1, 6));
+            }
+            if (randomBoolean()) {
+                doc.put("num", randomIntBetween(0, 1000));
+            }
+            // The source of a columnar index reads back with the dotted names of the fields, so that is how they are indexed too.
+            if (randomBoolean()) {
+                doc.put("obj.inner", randomKeywords(1, 6));
+            }
+            if (randomBoolean()) {
+                doc.put("obj.inner_num", randomIntBetween(0, 1000));
+            }
+            expectedSources.add(doc);
+            parsedDocs.add(mapperService.documentMapper().parse(source(b -> b.mapContents(doc))));
+        }
+
+        withLuceneIndex(mapperService, iw -> {
+            for (ParsedDocument parsed : parsedDocs) {
+                iw.addDocument(parsed.rootDoc());
+            }
+        }, reader -> {
+            SourceLoader loader = mapperService.mappingLookup().newSourceLoader(null, SourceFieldMetrics.NOOP, null);
+            int checked = 0;
+            for (LeafReaderContext leaf : reader.leaves()) {
+                int[] docIds = IntStream.range(0, leaf.reader().maxDoc()).toArray();
+                SourceLoader.Leaf sourceLeaf = loader.leaf(leaf, docIds);
+                LeafStoredFieldLoader sfLoader = StoredFieldLoader.create(false, loader.requiredStoredFields()).getLoader(leaf, docIds);
+                for (int docId : docIds) {
+                    sfLoader.advanceTo(docId);
+                    Map<String, Object> source = sourceLeaf.source(sfLoader, docId).source();
+                    int id = Integer.parseInt((String) source.get("z_id"));
+                    assertThat("doc " + id, source, equalTo(expectedSources.get(id)));
+                    checked++;
+                }
+            }
+            assertThat(checked, equalTo(numDocs));
+        });
+    }
+
+    /** One keyword, or an array of two or three (a single value reads back as a scalar, so there are no one-element arrays). */
+    private static Object randomKeywords(int minLength, int maxLength) {
+        if (randomBoolean()) {
+            return randomAlphaOfLengthBetween(minLength, maxLength);
+        }
+        return IntStream.range(0, between(2, 3)).mapToObj(i -> randomAlphaOfLengthBetween(minLength, maxLength)).toList();
+    }
+
+    /**
+     * Verifies that in columnar_stored mode a nested field round-trips: the source blob is materialized at index time
+     * from the in-memory document tree (children reconstructed by parent-pointer match), and read back from the blob.
+     */
+    public void testColumnarStoredSourceNestedRoundTrip() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("comments");
+            {
+                b.field("type", "nested");
+                b.startObject("properties");
+                {
+                    b.startObject("message").field("type", "keyword").endObject();
+                    b.startObject("votes").field("type", "long").endObject();
+                }
+                b.endObject();
+            }
+            b.endObject();
+        }));
+
+        ParsedDocument parsed = mapperService.documentMapper().parse(source(b -> {
+            b.startArray("comments");
+            b.startObject().field("message", "first").field("votes", 3).endObject();
+            b.startObject().field("message", "second").field("votes", 7).endObject();
+            b.endArray();
+        }));
+
+        // addDocuments indexes the nested children followed by the root as a block; the root is the last doc.
+        withLuceneIndex(mapperService, iw -> iw.addDocuments(parsed.docs()), unwrapped -> {
+            // The nested source loader builds a parent bitset, which needs a shard-wrapped reader (as in production).
+            DirectoryReader reader = wrapInMockESDirectoryReader(unwrapped);
+            SourceLoader loader = mapperService.mappingLookup().newSourceLoader(null, SourceFieldMetrics.NOOP, null);
+            LeafReaderContext leaf = reader.leaves().get(0);
+            int rootDocId = parsed.docs().size() - 1;
+            int[] docIds = IntStream.range(0, leaf.reader().maxDoc()).toArray();
+            SourceLoader.Leaf sourceLeaf = loader.leaf(leaf, docIds);
+            LeafStoredFieldLoader sfLoader = StoredFieldLoader.create(false, loader.requiredStoredFields()).getLoader(leaf, docIds);
+            sfLoader.advanceTo(rootDocId);
+            Source source = sourceLeaf.source(sfLoader, rootDocId);
+            assertThat(
+                source.internalSourceRef().utf8ToString(),
+                equalTo("{\"comments\":[{\"message\":\"first\",\"votes\":3},{\"message\":\"second\",\"votes\":7}]}")
+            );
+        });
+    }
+
+    /**
+     * Verifies that a multi-valued leaf inside a nested object preserves array order in columnar_stored mode too: the
+     * offsets recorded per child document are reconstructed when the index-time blob is materialized.
+     */
+    public void testColumnarStoredSourceNestedLeafArrayRoundTrip() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("comments");
+            {
+                b.field("type", "nested");
+                b.startObject("properties");
+                b.startObject("stars").field("type", "long").endObject();
+                b.endObject();
+            }
+            b.endObject();
+        }));
+
+        ParsedDocument parsed = mapperService.documentMapper().parse(source(b -> {
+            b.startArray("comments");
+            b.startObject().array("stars", 50, 10, 30).endObject();
+            b.startObject().array("stars", 20, 40).endObject();
+            b.endArray();
+        }));
+
+        withLuceneIndex(mapperService, iw -> iw.addDocuments(parsed.docs()), unwrapped -> {
+            DirectoryReader reader = wrapInMockESDirectoryReader(unwrapped);
+            SourceLoader loader = mapperService.mappingLookup().newSourceLoader(null, SourceFieldMetrics.NOOP, null);
+            LeafReaderContext leaf = reader.leaves().get(0);
+            int rootDocId = parsed.docs().size() - 1;
+            int[] docIds = IntStream.range(0, leaf.reader().maxDoc()).toArray();
+            SourceLoader.Leaf sourceLeaf = loader.leaf(leaf, docIds);
+            LeafStoredFieldLoader sfLoader = StoredFieldLoader.create(false, loader.requiredStoredFields()).getLoader(leaf, docIds);
+            sfLoader.advanceTo(rootDocId);
+            Source source = sourceLeaf.source(sfLoader, rootDocId);
+            assertThat(source.internalSourceRef().utf8ToString(), equalTo("{\"comments\":[{\"stars\":[50,10,30]},{\"stars\":[20,40]}]}"));
+        });
+    }
+
+    /**
+     * Verifies that a document whose columnar_stored blob fails half way, while a nested child is being written, leaves nothing
+     * behind for the next document. The thread reuses the source loader, and the nested field reuses the leaf of its children, so
+     * the reset after a failure has to reach the loaders of the fields inside the nested object as well.
+     */
+    public void testColumnarStoredSourceResetsNestedLoadersAfterFailedWrite() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("comments");
+            {
+                b.field("type", "nested");
+                b.startObject("properties");
+                {
+                    b.startObject("message").field("type", "keyword").endObject();
+                    b.startObject("votes").field("type", "long").endObject();
+                }
+                b.endObject();
+            }
+            b.endObject();
+        }));
+
+        // Enough values that the JSON generator flushes its buffer, and so hits the failing stream, while the first child is written.
+        List<String> manyValues = IntStream.range(0, 4000).mapToObj(i -> "v" + i).toList();
+        ParsedDocument failing = mapperService.documentMapper().parse(source(b -> {
+            b.startArray("comments");
+            b.startObject().field("message", manyValues).field("votes", 1).endObject();
+            b.startObject().field("message", "second").field("votes", 2).endObject();
+            b.endArray();
+        }));
+        ParsedDocument next = mapperService.documentMapper().parse(source(b -> {
+            b.startObject("comments").field("message", "ok").field("votes", 3).endObject();
+        }));
+        // The writer runs before postParse attaches the whole-document blob, so the documents it gets do not carry one yet.
+        for (ParsedDocument parsed : List.of(failing, next)) {
+            parsed.rootDoc().getFields().removeIf(f -> f.name().equals(IgnoredSourceFieldMapper.NAME));
+        }
+
+        ColumnarSourceWriter writer = new ColumnarSourceWriter(null);
+        MappingLookup mappingLookup = mapperService.mappingLookup();
+        OutputStream failingStream = new OutputStream() {
+            @Override
+            public void write(int b) throws IOException {
+                throw new IOException("boom");
+            }
+        };
+        // Not closed: closing flushes, which would throw again.
+        XContentBuilder failingBuilder = new XContentBuilder(JsonXContent.jsonXContent, failingStream);
+        IOException e = expectThrows(
+            IOException.class,
+            () -> writer.write(mappingLookup, failing.docs(), failing.rootDoc(), failingBuilder)
+        );
+        assertThat(e.getMessage(), equalTo("boom"));
+
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            writer.write(mappingLookup, next.docs(), next.rootDoc(), builder);
+            assertThat(Strings.toString(builder), equalTo("{\"comments\":{\"message\":\"ok\",\"votes\":3}}"));
+        }
+    }
+
+    /**
+     * Verifies that in columnar_stored mode, {@code postParse} removes the per-field fallback fields used only for
+     * synthetic-source reconstruction once the whole-document blob has been written to {@code _ignored_source}.
+     */
+    public void testColumnarStoredPrunesFallbackFields() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("num");
+            b.field("type", "integer");
+            b.field("ignore_malformed", true);
+            b.endObject();
+            b.startObject("kwd");
+            b.field("type", "keyword");
+            b.field("ignore_above", 3);
+            b.endObject();
+        }));
+        ParsedDocument doc = mapperService.documentMapper().parse(source(b -> {
+            b.field("num", "not_a_number");
+            b.field("kwd", "long_ignored_value");
+        }));
+        LuceneDocument rootDoc = doc.rootDoc();
+        // Fallback fields for synthetic-source reconstruction must have been pruned.
+        // In COLUMNAR mode, ignore_malformed routes to ._on_failure (not ._ignore_malformed), and COLUMNAR_STORED prunes both.
+        assertNull("._ignore_malformed field should have been pruned", rootDoc.getField("num._ignore_malformed"));
+        assertNull("._ignore_malformed.counts field should have been pruned", rootDoc.getField("num._ignore_malformed.counts"));
+        assertNull("._on_failure field should have been pruned", rootDoc.getField("num._on_failure"));
+        assertNull("._on_failure.counts field should have been pruned", rootDoc.getField("num._on_failure.counts"));
+        assertNull("._original field should have been pruned", rootDoc.getField("kwd._original"));
+        assertNull("._original.counts field should have been pruned", rootDoc.getField("kwd._original.counts"));
+        // The whole-document _ignored_source blob and the queryable _ignored meta-field must still be present
+        assertNotNull("_ignored_source blob must still be present", rootDoc.getField(IgnoredSourceFieldMapper.NAME));
+        assertNotNull("_ignored meta-field must still be present", rootDoc.getField(IgnoredFieldMapper.NAME));
+    }
+
+    /**
+     * In {@code columnar_stored} mode the source blob materialized at index time leaves out every vector field, at the root
+     * and inside a {@code nested} object alike: those values are already held in the vector index, in doc values or in a
+     * stored field, and are patched back into {@code _source} on read.
+     */
+    public void testColumnarStoredExcludesVectorsFromSourceBlob() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .put(IndexSettings.INDEX_MAPPING_EXCLUDE_SOURCE_VECTORS_SETTING.getKey(), true)
+            .build();
+        MapperService mapperService = createMapperService(settings, mapping(b -> {
+            b.startObject("kwd").field("type", "keyword").endObject();
+            vectorFields(b);
+            b.startObject("nested").field("type", "nested").startObject("properties");
+            b.startObject("kwd").field("type", "keyword").endObject();
+            vectorFields(b);
+            b.endObject().endObject();
+        }));
+
+        ParsedDocument doc = mapperService.documentMapper().parse(source(b -> {
+            b.field("kwd", "a");
+            vectorValues(b);
+            b.startArray("nested");
+            b.startObject().field("kwd", "b");
+            vectorValues(b);
+            b.endObject();
+            b.startObject().field("kwd", "c").endObject();
+            b.endArray();
+        }));
+
+        BytesRef blob = doc.rootDoc().getField(IgnoredSourceFieldMapper.NAME).binaryValue();
+        String encoded = new BytesArray(blob).utf8ToString();
+        assertThat(encoded.substring(encoded.indexOf('{')), equalTo("{\"kwd\":\"a\",\"nested\":[{\"kwd\":\"b\"},{\"kwd\":\"c\"}]}"));
+    }
+
+    /**
+     * A vector field the mapping's own {@code _source} filter already excludes is still indexed: the blob filter combines the
+     * two sets of excludes rather than repeating the field.
+     */
+    public void testColumnarStoredVectorAlreadyExcludedByTheMapping() throws IOException {
+        Settings settings = Settings.builder()
+            .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.COLUMNAR_STORED.toString())
+            .put(IndexSettings.SEQ_NO_INDEX_OPTIONS_SETTING.getKey(), SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY)
+            .put(IndexSettings.INDEX_MAPPING_EXCLUDE_SOURCE_VECTORS_SETTING.getKey(), true)
+            .build();
+        MapperService mapperService = createMapperService(settings, topMapping(b -> {
+            b.startObject("_source").array("excludes", "not_indexed").endObject();
+            b.startObject("properties");
+            b.startObject("kwd").field("type", "keyword").endObject();
+            vectorFields(b);
+            b.endObject();
+        }));
+
+        ParsedDocument doc = mapperService.documentMapper().parse(source(b -> {
+            b.field("kwd", "a");
+            vectorValues(b);
+        }));
+
+        BytesRef blob = doc.rootDoc().getField(IgnoredSourceFieldMapper.NAME).binaryValue();
+        String encoded = new BytesArray(blob).utf8ToString();
+        assertThat(encoded.substring(encoded.indexOf('{')), equalTo("{\"kwd\":\"a\"}"));
+    }
+
+    /** One field per storage layout a vector can use: the vector index, binary doc values, and a stored field. */
+    private static void vectorFields(XContentBuilder b) throws IOException {
+        b.startObject("indexed");
+        b.field("type", "dense_vector").field("dims", 3).field("index", true).field("similarity", "l2_norm");
+        b.endObject();
+        b.startObject("not_indexed").field("type", "dense_vector").field("dims", 3).field("index", false).endObject();
+        b.startObject("sparse").field("type", "sparse_vector").endObject();
+    }
+
+    private static void vectorValues(XContentBuilder b) throws IOException {
+        b.array("indexed", new float[] { 1.5f, 2.5f, 3.5f });
+        b.array("not_indexed", new float[] { 4.5f, 5.5f, 6.5f });
+        b.startObject("sparse").field("running", 1.5f).endObject();
+    }
+
+    public void testRecoverySourceWithLogs() throws IOException {
+        {
+            Settings settings = Settings.builder().put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.getName()).build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(27L));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.getName())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                .build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(27L));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.getName())
+                .put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false)
+                .build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("@timestamp", "2012-02-13")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWithColumnar() throws IOException {
+        {
+            Settings settings = Settings.builder().put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName()).build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(27L));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                .build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(27L));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+                .put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false)
+                .build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("@timestamp", "2012-02-13")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWithColumnarLogsdb() throws IOException {
+        {
+            Settings settings = Settings.builder().put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB_COLUMNAR.getName()).build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(27L));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB_COLUMNAR.getName())
+                .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                .build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNotNull(doc.rootDoc().getField("_recovery_source_size"));
+            assertThat(doc.rootDoc().getField("_recovery_source_size").numericValue(), equalTo(27L));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB_COLUMNAR.getName())
+                .put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false)
+                .build();
+            MapperService mapperService = createMapperService(settings, mapping(b -> {}));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("@timestamp", "2012-02-13")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testStandardIndexModeWithSourceModeSetting() throws IOException {
+        // Test for IndexMode.STANDARD
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.STANDARD.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isSynthetic());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.STANDARD.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            final DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isStored());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.STANDARD.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.DISABLED)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            final DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isDisabled());
+        }
+
+        // Test for IndexMode.LOGSDB
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isSynthetic());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            final DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isStored());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.DISABLED)
+                .build();
+            var ex = expectThrows(MapperParsingException.class, () -> createMapperService(settings, mappings));
+            assertEquals("Failed to parse mapping: _source can not be disabled in index using [logsdb] index mode", ex.getMessage());
+        }
+
+        // Test for IndexMode.COLUMNAR
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isSynthetic());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED)
+                .build();
+            expectThrows(IllegalArgumentException.class, () -> createMapperService(settings, mappings));
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.DISABLED)
+                .build();
+            expectThrows(IllegalArgumentException.class, () -> createMapperService(settings, mappings));
+        }
+
+        // Test for IndexMode.LOGSDB_COLUMNAR
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB_COLUMNAR.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isSynthetic());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB_COLUMNAR.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED)
+                .build();
+            expectThrows(IllegalArgumentException.class, () -> createMapperService(settings, mappings));
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB_COLUMNAR.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.DISABLED)
+                .build();
+            expectThrows(IllegalArgumentException.class, () -> createMapperService(settings, mappings));
+        }
+
+        // Test for IndexMode.TIME_SERIES
+        {
+            final String mappings = """
+                    {
+                        "_doc" : {
+                            "properties": {
+                                "routing_field": {
+                                    "type": "keyword",
+                                    "time_series_dimension": true
+                                }
+                            }
+                        }
+                    }
+                """;
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC)
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "routing_field")
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isSynthetic());
+        }
+        {
+            final String mappings = """
+                    {
+                        "_doc" : {
+                            "properties": {
+                                "routing_field": {
+                                    "type": "keyword",
+                                    "time_series_dimension": true
+                                }
+                            }
+                        }
+                    }
+                """;
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED)
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "routing_field")
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            final DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isStored());
+        }
+        {
+            final String mappings = """
+                    {
+                        "_doc" : {
+                            "properties": {
+                                "routing_field": {
+                                    "type": "keyword",
+                                    "time_series_dimension": true
+                                }
+                            }
+                        }
+                    }
+                """;
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.name())
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.DISABLED)
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "routing_field")
+                .build();
+            var ex = expectThrows(MapperParsingException.class, () -> createMapperService(settings, mappings));
+            assertEquals("Failed to parse mapping: _source can not be disabled in index using [time_series] index mode", ex.getMessage());
+        }
+
+        // Test cases without IndexMode (default to standard)
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isSynthetic());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.STORED)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            final DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isStored());
+        }
+        {
+            final XContentBuilder mappings = topMapping(b -> {});
+            final Settings settings = Settings.builder()
+                .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.DISABLED)
+                .build();
+            final MapperService mapperService = createMapperService(settings, mappings);
+            final DocumentMapper docMapper = mapperService.documentMapper();
+            assertTrue(docMapper.sourceMapper().isDisabled());
+        }
+    }
+
+    public void testRecoverySourceWithLogsCustom() throws IOException {
+        XContentBuilder mappings = topMapping(b -> b.startObject(SourceFieldMapper.NAME).field("mode", "synthetic").endObject());
+        {
+            Settings settings = Settings.builder().put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.getName()).build();
+            MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> { b.field("@timestamp", "2012-02-13"); }));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+        {
+            Settings settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.LOGSDB.getName())
+                .put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false)
+                .build();
+            MapperService mapperService = createMapperService(settings, mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source(b -> b.field("@timestamp", "2012-02-13")));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWithTimeSeries() throws IOException {
+        {
+            Settings.Builder settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.getName())
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "field")
+                // Synthetic _ids are not relevant to this test and the "123" id used is not synthetic-id-conformant
+                .put(IndexSettings.SYNTHETIC_ID.getKey(), false);
+            MapperService mapperService = createMapperService(settings.build(), fieldMapping(b -> {
+                b.field("type", "keyword");
+                b.field("time_series_dimension", true);
+            }));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source("123", b -> b.field("@timestamp", "2012-02-13").field("field", "value1"), null));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+        {
+            Settings.Builder settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.getName())
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "field")
+                .put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false)
+                // Synthetic _ids are not relevant to this test and the "123" id used is not synthetic-id-conformant
+                .put(IndexSettings.SYNTHETIC_ID.getKey(), false);
+            MapperService mapperService = createMapperService(settings.build(), fieldMapping(b -> {
+                b.field("type", "keyword");
+                b.field("time_series_dimension", true);
+            }));
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(
+                source("123", b -> b.field("@timestamp", "2012-02-13").field("field", randomAlphaOfLength(5)), null)
+            );
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testRecoverySourceWithTimeSeriesCustom() throws IOException {
+        String mappings = """
+                {
+                    "_doc" : {
+                        "_source" : {
+                            "mode" : "synthetic"
+                        },
+                        "properties": {
+                            "field": {
+                                "type": "keyword",
+                                "time_series_dimension": true
+                            }
+                        }
+                    }
+                }
+            """;
+        {
+            Settings.Builder settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.getName())
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "field")
+                // Synthetic _ids are not relevant to this test and the "123" id used is not synthetic-id-conformant
+                .put(IndexSettings.SYNTHETIC_ID.getKey(), false);
+            MapperService mapperService = createMapperService(settings.build(), mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(source("123", b -> b.field("@timestamp", "2012-02-13").field("field", "value1"), null));
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+        {
+            Settings.Builder settings = Settings.builder()
+                .put(IndexSettings.MODE.getKey(), IndexMode.TIME_SERIES.getName())
+                .put(IndexMetadata.INDEX_ROUTING_PATH.getKey(), "field")
+                .put(INDICES_RECOVERY_SOURCE_ENABLED_SETTING.getKey(), false)
+                // Synthetic _ids are not relevant to this test and the "123" id used is not synthetic-id-conformant
+                .put(IndexSettings.SYNTHETIC_ID.getKey(), false);
+            MapperService mapperService = createMapperService(settings.build(), mappings);
+            DocumentMapper docMapper = mapperService.documentMapper();
+            ParsedDocument doc = docMapper.parse(
+                source("123", b -> b.field("@timestamp", "2012-02-13").field("field", randomAlphaOfLength(5)), null)
+            );
+            assertNull(doc.rootDoc().getField("_recovery_source"));
+        }
+    }
+
+    public void testColumnarParseRegistersRecoverySourceSizeColumnForSyntheticRecovery() throws Exception {
+        // Synthetic source mode: stored() == false, and recovery source uses a size estimate column
+        Settings.Builder settings = Settings.builder()
+            .put(IndexSettings.INDEX_MAPPER_SOURCE_MODE_SETTING.getKey(), SourceFieldMapper.Mode.SYNTHETIC.toString())
+            .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true);
+        MapperService mapperService = createMapperService(settings.build(), mapping(b -> {}));
+        SourceFieldMapper mapper = (SourceFieldMapper) mapperService.documentMapper().mappers().getMapper(SourceFieldMapper.NAME);
+        assertNotNull(mapper);
+        assertTrue(
+            "supportsColumnarParse must be true for synthetic source + synthetic recovery",
+            mapper.supportsColumnarParse(mapperService.getIndexSettings())
+        );
+
+        byte[] doc1Source = "{\"field\":\"value\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] doc2Source = "{\"field\":\"longer_value\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        IndexRequest[] requests = new IndexRequest[] {
+            new IndexRequest("index").id("1").source(new BytesArray(doc1Source), XContentType.JSON),
+            new IndexRequest("index").id("2").source(new BytesArray(doc2Source), XContentType.JSON) };
+        IndexOperationBatch batch = EngineTestCase.initFromRequests(requests);
+        try (
+            BatchMappingContext context = new BatchMappingContext(
+                batch,
+                mapperService.mappingLookup(),
+                mapperService.getIndexSettings(),
+                new BytesRefRecycler(new MockPageCacheRecycler(Settings.EMPTY))
+            )
+        ) {
+            mapper.preColumnarParse(context);
+
+            final MappedColumns mappedColumns = context.columns();
+            Column sizeColumn = null;
+            for (Column column : mappedColumns.toColumnBatch().columns()) {
+                if (column.name().equals(SourceFieldMapper.RECOVERY_SOURCE_SIZE_NAME)) {
+                    sizeColumn = column;
+                }
+            }
+            assertNotNull("expected a _recovery_source_size column", sizeColumn);
+            assertEquals("doc values type must be NUMERIC", DocValuesType.NUMERIC, sizeColumn.fieldType().docValuesType());
+            assertEquals("must have no inverted index", IndexOptions.NONE, sizeColumn.fieldType().indexOptions());
+            assertFalse("must not be stored", sizeColumn.fieldType().stored());
+
+            LongColumn longColumn = (LongColumn) sizeColumn;
+            var cursor = longColumn.tuples();
+            assertEquals(0, cursor.nextDoc());
+            assertTrue("size estimate for doc1 must be positive", cursor.longValue() > 0);
+            assertEquals(1, cursor.nextDoc());
+            assertTrue("size estimate for doc2 must be positive", cursor.longValue() > 0);
+            assertEquals(DocIdSetIterator.NO_MORE_DOCS, cursor.nextDoc());
+        }
+    }
+}

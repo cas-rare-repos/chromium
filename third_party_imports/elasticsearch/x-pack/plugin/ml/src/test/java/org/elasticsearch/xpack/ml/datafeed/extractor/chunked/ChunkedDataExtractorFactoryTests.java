@@ -1,0 +1,181 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+package org.elasticsearch.xpack.ml.datafeed.extractor.chunked;
+
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.search.SearchModule;
+import org.elasticsearch.search.aggregations.AggregationBuilders;
+import org.elasticsearch.search.aggregations.AggregatorFactories;
+import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.xcontent.NamedXContentRegistry;
+import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
+import org.elasticsearch.xpack.core.ml.job.config.AnalysisConfig;
+import org.elasticsearch.xpack.core.ml.job.config.DataDescription;
+import org.elasticsearch.xpack.core.ml.job.config.Detector;
+import org.elasticsearch.xpack.core.ml.job.config.Job;
+import org.elasticsearch.xpack.ml.datafeed.extractor.DataExtractorFactory;
+import org.junit.Before;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.is;
+import static org.mockito.Mockito.mock;
+
+public class ChunkedDataExtractorFactoryTests extends ESTestCase {
+
+    private DataExtractorFactory dataExtractorFactory;
+
+    @Override
+    protected NamedXContentRegistry xContentRegistry() {
+        SearchModule searchModule = new SearchModule(Settings.EMPTY, Collections.emptyList());
+        return new NamedXContentRegistry(searchModule.getNamedXContents());
+    }
+
+    @Before
+    public void setUpMocks() {
+        dataExtractorFactory = mock(DataExtractorFactory.class);
+    }
+
+    public void testNewExtractor_GivenAlignedTimes() {
+        ChunkedDataExtractorFactory factory = createFactory(1000L);
+
+        ChunkedDataExtractor dataExtractor = (ChunkedDataExtractor) factory.newExtractor(2000, 5000);
+
+        assertThat(dataExtractor.getContext().start(), equalTo(2000L));
+        assertThat(dataExtractor.getContext().end(), equalTo(5000L));
+    }
+
+    public void testNewExtractor_GivenNonAlignedTimes() {
+        ChunkedDataExtractorFactory factory = createFactory(1000L);
+
+        ChunkedDataExtractor dataExtractor = (ChunkedDataExtractor) factory.newExtractor(3980, 9200);
+
+        assertThat(dataExtractor.getContext().start(), equalTo(4000L));
+        assertThat(dataExtractor.getContext().end(), equalTo(9000L));
+    }
+
+    public void testIntervalTimeAligner() {
+        ChunkedDataExtractorContext.TimeAligner timeAligner = ChunkedDataExtractorFactory.newIntervalTimeAligner(100L);
+        assertThat(timeAligner.alignToFloor(300L), equalTo(300L));
+        assertThat(timeAligner.alignToFloor(301L), equalTo(300L));
+        assertThat(timeAligner.alignToFloor(399L), equalTo(300L));
+        assertThat(timeAligner.alignToFloor(400L), equalTo(400L));
+        assertThat(timeAligner.alignToCeil(300L), equalTo(300L));
+        assertThat(timeAligner.alignToCeil(301L), equalTo(400L));
+        assertThat(timeAligner.alignToCeil(399L), equalTo(400L));
+        assertThat(timeAligner.alignToCeil(400L), equalTo(400L));
+    }
+
+    public void testIdentityTimeAligner() {
+        ChunkedDataExtractorContext.TimeAligner timeAligner = ChunkedDataExtractorFactory.newIdentityTimeAligner();
+        assertThat(timeAligner.alignToFloor(300L), equalTo(300L));
+        assertThat(timeAligner.alignToFloor(301L), equalTo(301L));
+        assertThat(timeAligner.alignToFloor(399L), equalTo(399L));
+        assertThat(timeAligner.alignToFloor(400L), equalTo(400L));
+        assertThat(timeAligner.alignToCeil(300L), equalTo(300L));
+        assertThat(timeAligner.alignToCeil(301L), equalTo(301L));
+        assertThat(timeAligner.alignToCeil(399L), equalTo(399L));
+        assertThat(timeAligner.alignToCeil(400L), equalTo(400L));
+    }
+
+    public void testEsqlWindowShouldAlignToDeclaredGroupingInterval() {
+        ChunkedDataExtractorFactory factory = createEsqlFactory(TimeValue.timeValueSeconds(1));
+
+        ChunkedDataExtractor dataExtractor = (ChunkedDataExtractor) factory.newExtractor(3_980L, 9_200L);
+
+        assertThat(dataExtractor.getContext().start(), equalTo(3_000L));
+        assertThat(dataExtractor.getContext().end(), equalTo(9_000L));
+    }
+
+    public void testEsqlWindowShouldIncludeBucketContainingUnalignedStart() {
+        ChunkedDataExtractorFactory factory = createEsqlFactory(TimeValue.timeValueHours(1));
+
+        // start 09:14:53 inside the [09:00, 10:00) bucket: that bucket (emitted with time 09:00) must not be dropped
+        long start = Duration.ofHours(9).plusMinutes(14).plusSeconds(53).toMillis();
+        ChunkedDataExtractor dataExtractor = (ChunkedDataExtractor) factory.newExtractor(start, Duration.ofHours(10).toMillis());
+
+        assertThat(dataExtractor.getContext().start(), equalTo(Duration.ofHours(9).toMillis()));
+        assertThat(dataExtractor.getContext().end(), equalTo(Duration.ofHours(10).toMillis()));
+    }
+
+    public void testEsqlWindowInsideSingleBucketShouldBeEmptyRatherThanInverted() {
+        ChunkedDataExtractorFactory factory = createEsqlFactory(TimeValue.timeValueHours(1));
+
+        long windowStart = Duration.ofHours(9).plusMinutes(14).toMillis();
+        long windowEnd = Duration.ofHours(9).plusMinutes(29).toMillis();
+        ChunkedDataExtractor dataExtractor = (ChunkedDataExtractor) factory.newExtractor(windowStart, windowEnd);
+
+        // the bucket containing the (unaligned) end is still open, so it is never extracted
+        assertThat(dataExtractor.getContext().start(), equalTo(Duration.ofHours(9).toMillis()));
+        assertThat(dataExtractor.getContext().end(), equalTo(Duration.ofHours(9).toMillis()));
+        assertThat(dataExtractor.hasNext(), is(false));
+    }
+
+    public void testEsqlWindowShouldAlignToOneMinuteGroupingInterval() {
+        ChunkedDataExtractorFactory factory = createEsqlFactory(TimeValue.timeValueMinutes(1));
+
+        ChunkedDataExtractor dataExtractor = (ChunkedDataExtractor) factory.newExtractor(3_650_000L, 7_250_000L);
+
+        assertThat(dataExtractor.getContext().start(), equalTo(3_600_000L));
+        assertThat(dataExtractor.getContext().end(), equalTo(7_200_000L));
+    }
+
+    private ChunkedDataExtractorFactory createEsqlFactory(TimeValue groupingInterval) {
+        DataDescription.Builder dataDescription = new DataDescription.Builder();
+        dataDescription.setTimeField("time");
+        Detector.Builder detectorBuilder = new Detector.Builder();
+        detectorBuilder.setFunction("count");
+        AnalysisConfig.Builder analysisConfig = new AnalysisConfig.Builder(Arrays.asList(detectorBuilder.build()));
+        analysisConfig.setBucketSpan(groupingInterval);
+        Job.Builder jobBuilder = new Job.Builder("foo");
+        jobBuilder.setDataDescription(dataDescription);
+        jobBuilder.setAnalysisConfig(analysisConfig);
+        DatafeedConfig.Builder datafeedConfigBuilder = new DatafeedConfig.Builder("foo-feed", jobBuilder.getId());
+        datafeedConfigBuilder.setEsqlQuery("FROM logs");
+        datafeedConfigBuilder.setSourceTimeField("@timestamp");
+        datafeedConfigBuilder.setGroupingInterval(groupingInterval);
+        return new ChunkedDataExtractorFactory(
+            datafeedConfigBuilder.build(),
+            jobBuilder.build(new Date()),
+            xContentRegistry(),
+            dataExtractorFactory
+        );
+    }
+
+    private ChunkedDataExtractorFactory createFactory(long histogramInterval) {
+        AggregatorFactories.Builder aggs = new AggregatorFactories.Builder().addAggregator(
+            AggregationBuilders.histogram("time")
+                .field("time")
+                .interval(histogramInterval)
+                .subAggregation(AggregationBuilders.max("time").field("time"))
+        );
+        DataDescription.Builder dataDescription = new DataDescription.Builder();
+        dataDescription.setTimeField("time");
+        Detector.Builder detectorBuilder = new Detector.Builder();
+        detectorBuilder.setFunction("sum");
+        detectorBuilder.setFieldName("value");
+        AnalysisConfig.Builder analysisConfig = new AnalysisConfig.Builder(Arrays.asList(detectorBuilder.build()));
+        analysisConfig.setSummaryCountFieldName("doc_count");
+        Job.Builder jobBuilder = new Job.Builder("foo");
+        jobBuilder.setDataDescription(dataDescription);
+        jobBuilder.setAnalysisConfig(analysisConfig);
+        DatafeedConfig.Builder datafeedConfigBuilder = new DatafeedConfig.Builder("foo-feed", jobBuilder.getId());
+        datafeedConfigBuilder.setParsedAggregations(aggs);
+        datafeedConfigBuilder.setIndices(Arrays.asList("my_index"));
+        return new ChunkedDataExtractorFactory(
+            datafeedConfigBuilder.build(),
+            jobBuilder.build(new Date()),
+            xContentRegistry(),
+            dataExtractorFactory
+        );
+    }
+}

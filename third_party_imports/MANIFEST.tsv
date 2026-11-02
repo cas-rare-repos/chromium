@@ -11,3 +11,4 @@ rust	https://github.com/rust-lang/rust.git	4c46afa63688fb473618f9b3553d70b0c15a8
 go	https://github.com/golang/go.git	babb75be8cd5a3b1cd1a34fd837225cbef659d10	11605	124171409
 kubernetes	https://github.com/kubernetes/kubernetes.git	c5bdf2219eea569d6b973d224822f2a56c63d007	18922	219010194
 tensorflow	https://github.com/tensorflow/tensorflow.git	71724b0e705c78bc9dedb414b3848423343aee1a	25832	239677919
+elasticsearch	https://github.com/elastic/elasticsearch.git	3251bbfeaa07490d3f13fa3406dda43ac9e547b6	49772	497889888

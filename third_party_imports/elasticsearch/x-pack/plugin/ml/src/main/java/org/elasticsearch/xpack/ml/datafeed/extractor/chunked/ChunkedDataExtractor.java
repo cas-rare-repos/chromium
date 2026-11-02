@@ -1,0 +1,268 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+package org.elasticsearch.xpack.ml.datafeed.extractor.chunked;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.ResourceNotFoundException;
+import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
+import org.elasticsearch.xpack.core.ml.datafeed.SearchInterval;
+import org.elasticsearch.xpack.ml.datafeed.LinkedClusterState;
+import org.elasticsearch.xpack.ml.datafeed.extractor.DataExtractor;
+import org.elasticsearch.xpack.ml.datafeed.extractor.DataExtractorFactory;
+import org.elasticsearch.xpack.ml.datafeed.extractor.DataExtractorUtils;
+import org.elasticsearch.xpack.ml.datafeed.extractor.esql.EsqlDataExtractor;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * A wrapper {@link DataExtractor} that can be used with other extractors in order to perform
+ * searches in smaller chunks of the time range.
+ *
+ * <p> The chunk span can be either specified or not. When not specified,
+ * a heuristic is employed (see {@link #setUpChunkedSearch()}) to automatically determine the chunk span.
+ * The search is set up by querying a data summary for the given time range
+ * that includes the number of total hits and the earliest/latest times. Those are then used to determine the chunk span,
+ * when necessary, and to jump the search forward to the time where the earliest data can be found.
+ * If a search for a chunk returns empty, the set up is performed again for the remaining time.
+ *
+ * <p> Cancellation's behaviour depends on the delegate extractor.
+ *
+ * <p> Note that this class is NOT thread-safe.
+ */
+public class ChunkedDataExtractor implements DataExtractor {
+
+    private static final Logger LOGGER = LogManager.getLogger(ChunkedDataExtractor.class);
+
+    /** Let us set a minimum chunk span of 1 minute */
+    private static final long MIN_CHUNK_SPAN = 60000L;
+
+    /**
+     * Burst headroom when sizing an initial ES|QL chunk: target {@link #DEFAULT_ESQL_CHUNK_DOCS} rows per chunk, which is
+     * {@link EsqlDataExtractor#INJECTED_ROW_LIMIT} divided by this factor. A wrong estimate is corrected by shrinking the
+     * chunk when a result hits the injected limit (companion stack change).
+     */
+    private static final long CHUNK_HEADROOM_FACTOR = 5L;
+
+    /**
+     * Target rows per initial ES|QL chunk when chunk span is auto. ES|QL has no scroll; oversized chunks truncate at
+     * {@link EsqlDataExtractor#INJECTED_ROW_LIMIT}.
+     */
+    private static final long DEFAULT_ESQL_CHUNK_DOCS = EsqlDataExtractor.INJECTED_ROW_LIMIT / CHUNK_HEADROOM_FACTOR;
+
+    private final DataExtractorFactory dataExtractorFactory;
+    private final ChunkedDataExtractorContext context;
+    private long currentStart;
+    private long currentEnd;
+    private long chunkSpan;
+    private boolean isCancelled;
+    private DataExtractor currentExtractor;
+    private List<LinkedClusterState> lastLinkedClusterStates = List.of();
+
+    ChunkedDataExtractor(DataExtractorFactory dataExtractorFactory, ChunkedDataExtractorContext context) {
+        this.dataExtractorFactory = Objects.requireNonNull(dataExtractorFactory);
+        this.context = Objects.requireNonNull(context);
+        this.currentStart = context.start();
+        this.currentEnd = context.start();
+        this.isCancelled = false;
+    }
+
+    @Override
+    public DataSummary getSummary() {
+        return null;
+    }
+
+    @Override
+    public boolean hasNext() {
+        boolean currentHasNext = currentExtractor != null && currentExtractor.hasNext();
+        if (isCancelled()) {
+            return currentHasNext;
+        }
+        return currentHasNext || currentEnd < context.end();
+    }
+
+    @Override
+    public Result next() throws IOException {
+        if (hasNext() == false) {
+            throw new NoSuchElementException();
+        }
+
+        if (currentExtractor == null) {
+            // This is the first time next is called
+            setUpChunkedSearch();
+        }
+
+        return getNextStream();
+    }
+
+    private void setUpChunkedSearch() {
+        // Keep a reference so that if getSummary() throws (e.g. because a remote cluster was skipped)
+        // we can still recover the cluster states it observed and expose them via getLinkedClusterStates().
+        DataExtractor summaryExtractor = dataExtractorFactory.newExtractor(currentStart, context.end());
+        DataSummary dataSummary;
+        try {
+            dataSummary = summaryExtractor.getSummary();
+        } catch (ResourceNotFoundException e) {
+            List<LinkedClusterState> failedStates = summaryExtractor.getLinkedClusterStates();
+            if (failedStates.isEmpty() == false) {
+                lastLinkedClusterStates = DataExtractorUtils.preferRicherLinkedClusterStates(lastLinkedClusterStates, failedStates);
+            }
+            throw e;
+        }
+        if (dataSummary.hasData()) {
+            long earliestTime = context.timeAligner().alignToFloor(dataSummary.earliestTime());
+            // ES|QL summary MIN may precede the queried window (e.g. DATE_TRUNC). Jump forward so an
+            // unbounded range skips empty chunks.
+            currentStart = context.hasEsqlQuery() ? Math.max(currentStart, earliestTime) : earliestTime;
+            currentEnd = currentStart;
+
+            if (context.chunkSpan() != null) {
+                chunkSpan = context.chunkSpan().getMillis();
+            } else if (context.hasAggregations()) {
+                // This heuristic is a direct copy of the manual chunking config auto-creation done in {@link DatafeedConfig}
+                chunkSpan = DatafeedConfig.DEFAULT_AGGREGATION_CHUNKING_BUCKETS * context.histogramInterval();
+            } else if (context.hasEsqlQuery()) {
+                long timeSpread = dataSummary.latestTime() - dataSummary.earliestTime();
+                if (timeSpread <= 0) {
+                    chunkSpan = context.end() - currentEnd;
+                } else {
+                    // Same uniform-density heuristic as DSL below: totalHits over timeSpread, target DEFAULT_ESQL_CHUNK_DOCS rows.
+                    chunkSpan = Math.max(MIN_CHUNK_SPAN, DEFAULT_ESQL_CHUNK_DOCS * timeSpread / dataSummary.totalHits());
+                }
+            } else {
+                long timeSpread = dataSummary.latestTime() - dataSummary.earliestTime();
+                if (timeSpread <= 0) {
+                    chunkSpan = context.end() - currentEnd;
+                } else {
+                    // The heuristic here is that we want a time interval where we expect roughly scrollSize documents
+                    // (assuming data are uniformly spread over time).
+                    // We have totalHits documents over dataTimeSpread (latestTime - earliestTime), we want scrollSize documents over chunk.
+                    // Thus, the interval would be (scrollSize * dataTimeSpread) / totalHits.
+                    // However, assuming this as the chunk span may often lead to half-filled pages or empty searches.
+                    // It is beneficial to take a multiple of that. Based on benchmarking, we set this to 10x.
+                    chunkSpan = Math.max(MIN_CHUNK_SPAN, 10 * (context.scrollSize() * timeSpread) / dataSummary.totalHits());
+                }
+            }
+
+            chunkSpan = context.timeAligner().alignToCeil(chunkSpan);
+            LOGGER.debug("[{}] Chunked search configured: chunk span = {} ms", context.jobId(), chunkSpan);
+        } else {
+            // search is over
+            currentEnd = context.end();
+            LOGGER.debug("[{}] Chunked search configured: no data found", context.jobId());
+        }
+    }
+
+    private Result getNextStream() throws IOException {
+        SearchInterval lastSearchInterval = new SearchInterval(context.start(), context.end());
+        while (hasNext()) {
+            boolean isNewSearch = false;
+
+            if (currentExtractor == null || currentExtractor.hasNext() == false) {
+                // First search or the current search finished; we can advance to the next search
+                advanceTime();
+                isNewSearch = true;
+            }
+
+            Result result;
+            try {
+                result = currentExtractor.next();
+            } catch (IOException | RuntimeException e) {
+                // Capture states from the inner extractor before rethrowing so that
+                // getLinkedClusterStates() gives accurate data to DatafeedJob's catch block.
+                List<LinkedClusterState> innerStates = currentExtractor.getLinkedClusterStates();
+                if (innerStates.isEmpty() == false) {
+                    lastLinkedClusterStates = DataExtractorUtils.preferRicherLinkedClusterStates(lastLinkedClusterStates, innerStates);
+                }
+                throw e;
+            }
+            lastSearchInterval = result.searchInterval();
+            if (result.linkedClusterStates().isEmpty() == false) {
+                lastLinkedClusterStates = DataExtractorUtils.preferRicherLinkedClusterStates(
+                    lastLinkedClusterStates,
+                    result.linkedClusterStates()
+                );
+            }
+            if (result.data().isPresent()) {
+                return result;
+            }
+
+            if (isNewSearch && hasNext()) {
+                // If it was a new search it means it returned 0 results. Thus,
+                // we reconfigure and jump to the next time interval where there are data.
+                // In theory, if everything is consistent, it would be sufficient to call
+                // setUpChunkedSearch() here. However, the way that works is to take the
+                // query from the datafeed config and add on some simple aggregations.
+                // These aggregations are completely separate from any that might be defined
+                // in the datafeed config. It is possible that the aggregations in the
+                // datafeed config rather than the query are responsible for no data being
+                // found. For example, "filter" or "bucket_selector" aggregations can do this.
+                // Originally we thought this situation would never happen, with the query
+                // selecting data and the aggregations just grouping it, but recently we've
+                // seen cases of users filtering in the aggregations. Therefore, we
+                // unconditionally advance the start time by one chunk here. setUpChunkedSearch()
+                // might then advance substantially further, but in the pathological cases
+                // where setUpChunkedSearch() thinks data exists at the current start time
+                // while the datafeed's own aggregation doesn't, at least we'll step forward
+                // a little bit rather than go into an infinite loop.
+                currentStart += chunkSpan;
+                setUpChunkedSearch();
+            }
+        }
+        return new Result(lastSearchInterval, Optional.empty(), lastLinkedClusterStates);
+    }
+
+    private void advanceTime() {
+        // Destroy the previous extractor to clean up any scroll contexts before creating a new one
+        if (currentExtractor != null) {
+            currentExtractor.destroy();
+        }
+        currentStart = currentEnd;
+        currentEnd = Math.min(currentStart + chunkSpan, context.end());
+        currentExtractor = dataExtractorFactory.newExtractor(currentStart, currentEnd);
+        LOGGER.debug("[{}] advances time to [{}, {})", context.jobId(), currentStart, currentEnd);
+    }
+
+    @Override
+    public boolean isCancelled() {
+        return isCancelled;
+    }
+
+    @Override
+    public void cancel() {
+        if (currentExtractor != null) {
+            currentExtractor.cancel();
+        }
+        isCancelled = true;
+    }
+
+    @Override
+    public void destroy() {
+        cancel();
+        if (currentExtractor != null) {
+            currentExtractor.destroy();
+        }
+    }
+
+    @Override
+    public long getEndTime() {
+        return context.end();
+    }
+
+    @Override
+    public List<LinkedClusterState> getLinkedClusterStates() {
+        return lastLinkedClusterStates;
+    }
+
+    ChunkedDataExtractorContext getContext() {
+        return context;
+    }
+}

@@ -1,0 +1,1322 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+package org.elasticsearch.rest;
+
+import co.elastic.logging.log4j2.EcsLayout;
+
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.apache.logging.log4j.core.layout.PatternLayout;
+import org.apache.logging.log4j.message.MapMessage;
+import org.apache.lucene.util.SetOnce;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.ElasticsearchSecurityException;
+import org.elasticsearch.ElasticsearchStatusException;
+import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.ResourceAlreadyExistsException;
+import org.elasticsearch.ResourceNotFoundException;
+import org.elasticsearch.action.search.SearchPhaseExecutionException;
+import org.elasticsearch.action.search.ShardSearchFailure;
+import org.elasticsearch.common.ParsingException;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.logging.ESJsonLayout;
+import org.elasticsearch.common.logging.LogConfigurator;
+import org.elasticsearch.common.logging.Loggers;
+import org.elasticsearch.common.logging.MockAppender;
+import org.elasticsearch.common.transport.TransportAddress;
+import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.core.RestApiVersion;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.shard.ShardNotFoundException;
+import org.elasticsearch.indices.IndexClosedException;
+import org.elasticsearch.search.SearchShardTarget;
+import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.rest.FakeRestRequest;
+import org.elasticsearch.transport.RemoteTransportException;
+import org.elasticsearch.xcontent.MediaType;
+import org.elasticsearch.xcontent.NamedXContentRegistry;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentType;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.elasticsearch.ElasticsearchException.REST_EXCEPTION_SKIP_STACK_TRACE;
+import static org.elasticsearch.ElasticsearchExceptionTests.assertDeepEquals;
+import static org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
+import static org.elasticsearch.rest.RestController.ERROR_TRACE_DEFAULT;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.sameInstance;
+
+public class RestResponseTests extends ESTestCase {
+
+    private static MockAppender appender;
+    static Logger restSuppressedLogger = LogManager.getLogger("rest.suppressed");
+
+    @BeforeClass
+    public static void init() throws IllegalAccessException {
+        appender = new MockAppender("testAppender");
+        appender.start();
+        try {
+            LogConfigurator.setNodeName("test-node");
+        } catch (SetOnce.AlreadySetException e) {
+            // NOTE: the node name is a process wide SetOnce, so another suite running in this JVM may have set it already
+        }
+        Configurator.setLevel(restSuppressedLogger, Level.DEBUG);
+        Loggers.addAppender(restSuppressedLogger, appender);
+    }
+
+    @AfterClass
+    public static void cleanup() {
+        appender.stop();
+        Loggers.removeAppender(restSuppressedLogger, appender);
+    }
+
+    class UnknownException extends Exception {
+        UnknownException(final String message, final Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public void testWithHeaders() throws Exception {
+        RestRequest request = new FakeRestRequest();
+        RestChannel channel = randomBoolean() ? new DetailedExceptionRestChannel(request) : new SimpleExceptionRestChannel(request);
+
+        RestResponse response = new RestResponse(channel, new WithHeadersException());
+        assertEquals(3, response.getHeaders().size());
+        assertThat(response.getHeaders().get("n1"), notNullValue());
+        assertThat(response.getHeaders().get("n1"), contains("v11", "v12"));
+        assertThat(response.getHeaders().get("n2"), notNullValue());
+        assertThat(response.getHeaders().get("n2"), contains("v21", "v22"));
+        assertThat(response.getHeaders().get("My-Header"), notNullValue());
+        assertThat(response.getHeaders().get("My-Header"), contains("v1"));
+    }
+
+    public void testEmptyChunkedBody() {
+        RestResponse response = RestResponse.chunked(
+            RestStatus.OK,
+            ChunkedRestResponseBodyPart.fromTextChunks(RestResponse.TEXT_CONTENT_TYPE, Collections.emptyIterator()),
+            null
+        );
+        assertFalse(response.isChunked());
+        assertNotNull(response.content());
+        assertEquals(0, response.content().length());
+    }
+
+    public void testSimpleExceptionMessage() throws Exception {
+        RestRequest request = new FakeRestRequest();
+        RestChannel channel = new SimpleExceptionRestChannel(request);
+
+        Exception t = new ElasticsearchException("an error occurred reading data", new FileNotFoundException("/foo/bar"));
+        RestResponse response = new RestResponse(channel, t);
+        String text = response.content().utf8ToString();
+        assertThat(text, containsString("""
+            {"type":"exception","reason":"an error occurred reading data"}"""));
+        assertThat(text, not(containsString("file_not_found_exception")));
+        assertThat(text, not(containsString("/foo/bar")));
+        assertThat(text, not(containsString("error_trace")));
+    }
+
+    public void testDetailedExceptionMessage() throws Exception {
+        RestRequest request = new FakeRestRequest();
+        RestChannel channel = new DetailedExceptionRestChannel(request);
+
+        Exception t = new ElasticsearchException("an error occurred reading data", new FileNotFoundException("/foo/bar"));
+        RestResponse response = new RestResponse(channel, t);
+        String text = response.content().utf8ToString();
+        assertThat(text, containsString("""
+            {"type":"exception","reason":"an error occurred reading data"}"""));
+        assertThat(text, containsString("""
+            {"type":"file_not_found_exception","reason":"/foo/bar"}"""));
+    }
+
+    public void testErrorTrace() throws Exception {
+        RestRequest request = new FakeRestRequest();
+        request.params().put("error_trace", "true");
+        RestChannel channel = new DetailedExceptionRestChannel(request);
+
+        Exception t = new UnknownException("an error occurred reading data", new FileNotFoundException("/foo/bar"));
+        RestResponse response = new RestResponse(channel, t);
+        String text = response.content().utf8ToString();
+        assertThat(text, containsString("""
+            "type":"unknown_exception","reason":"an error occurred reading data\""""));
+        assertThat(text, containsString("""
+            {"type":"file_not_found_exception\""""));
+        assertThat(text, containsString("""
+            "stack_trace":"org.elasticsearch.ElasticsearchException$1: an error occurred reading data"""));
+    }
+
+    public void testAuthenticationFailedNoStackTrace() throws IOException {
+        for (Exception authnException : List.of(
+            new ElasticsearchSecurityException("failed authn", RestStatus.UNAUTHORIZED),
+            new ElasticsearchSecurityException("failed authn", RestStatus.UNAUTHORIZED, new ElasticsearchException("cause"))
+        )) {
+            for (RestRequest request : List.of(
+                new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).build(),
+                new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).withParams(Map.of("error_trace", Boolean.toString(true))).build()
+            )) {
+                for (RestChannel channel : List.of(new SimpleExceptionRestChannel(request), new DetailedExceptionRestChannel(request))) {
+                    RestResponse response = new RestResponse(channel, authnException);
+                    assertThat(response.status(), is(RestStatus.UNAUTHORIZED));
+                    assertThat(response.content().utf8ToString(), not(containsString(ElasticsearchException.STACK_TRACE)));
+                }
+            }
+        }
+    }
+
+    public void testStackTrace() throws IOException {
+        for (Exception exception : List.of(new ElasticsearchException("dummy"), new IllegalArgumentException("dummy"))) {
+            for (RestRequest request : List.of(
+                new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).build(),
+                new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).withParams(Map.of("error_trace", Boolean.toString(true))).build()
+            )) {
+                for (RestChannel channel : List.of(new SimpleExceptionRestChannel(request), new DetailedExceptionRestChannel(request))) {
+                    RestResponse response = new RestResponse(channel, exception);
+                    if (exception instanceof ElasticsearchException) {
+                        assertThat(response.status(), is(RestStatus.INTERNAL_SERVER_ERROR));
+                    } else {
+                        assertThat(response.status(), is(RestStatus.BAD_REQUEST));
+                    }
+                    boolean traceExists = request.paramAsBoolean("error_trace", ERROR_TRACE_DEFAULT) && channel.detailedErrorsEnabled();
+                    if (traceExists) {
+                        assertThat(response.content().utf8ToString(), containsString(ElasticsearchException.STACK_TRACE));
+                    } else {
+                        assertThat(response.content().utf8ToString(), not(containsString(ElasticsearchException.STACK_TRACE)));
+                    }
+                }
+            }
+        }
+    }
+
+    public void testGuessRootCause() throws IOException {
+        RestRequest request = new FakeRestRequest();
+        {
+            Exception e = new ElasticsearchException("an error occurred reading data", new FileNotFoundException("/foo/bar"));
+            RestResponse response = new RestResponse(new DetailedExceptionRestChannel(request), e);
+            String text = response.content().utf8ToString();
+            assertThat(text, containsString("""
+                {"root_cause":[{"type":"exception","reason":"an error occurred reading data"}]"""));
+        }
+        {
+            Exception e = new FileNotFoundException("/foo/bar");
+            RestResponse response = new RestResponse(new DetailedExceptionRestChannel(request), e);
+            String text = response.content().utf8ToString();
+            assertThat(text, containsString("""
+                {"root_cause":[{"type":"file_not_found_exception","reason":"/foo/bar"}]"""));
+        }
+    }
+
+    public void testNullThrowable() throws Exception {
+        RestRequest request = new FakeRestRequest();
+        RestChannel channel = new SimpleExceptionRestChannel(request);
+
+        RestResponse response = new RestResponse(channel, null);
+        String text = response.content().utf8ToString();
+        assertThat(text, containsString("\"type\":\"unknown\""));
+        assertThat(text, containsString("\"reason\":\"unknown\""));
+        assertThat(text, not(containsString("error_trace")));
+    }
+
+    public void testConvert() throws IOException {
+        RestRequest request = new FakeRestRequest();
+        RestChannel channel = new DetailedExceptionRestChannel(request);
+        ShardSearchFailure failure = new ShardSearchFailure(
+            new ParsingException(1, 2, "foobar", null),
+            new SearchShardTarget("node_1", new ShardId("foo", "_na_", 1), null)
+        );
+        ShardSearchFailure failure1 = new ShardSearchFailure(
+            new ParsingException(1, 2, "foobar", null),
+            new SearchShardTarget("node_1", new ShardId("foo", "_na_", 2), null)
+        );
+        SearchPhaseExecutionException ex = new SearchPhaseExecutionException(
+            "search",
+            "all shards failed",
+            new ShardSearchFailure[] { failure, failure1 }
+        );
+        RestResponse response = new RestResponse(channel, new RemoteTransportException("foo", ex));
+        String text = response.content().utf8ToString();
+        String expected = """
+            {
+              "error": {
+                "root_cause": [ { "type": "parsing_exception", "reason": "foobar", "line": 1, "col": 2 } ],
+                "type": "search_phase_execution_exception",
+                "reason": "all shards failed",
+                "phase": "search",
+                "grouped": true,
+                "failed_shards": [
+                  {
+                    "shard": 1,
+                    "index": "foo",
+                    "node": "node_1",
+                    "reason": {
+                      "type": "parsing_exception",
+                      "reason": "foobar",
+                      "line": 1,
+                      "col": 2
+                    }
+                  }
+                ]
+              },
+              "status": 400
+            }""";
+        assertEquals(XContentHelper.stripWhitespace(expected), XContentHelper.stripWhitespace(text));
+        String stackTrace = ExceptionsHelper.stackTrace(ex);
+        assertThat(stackTrace, containsString("org.elasticsearch.common.ParsingException: foobar"));
+    }
+
+    public void testResponseWhenPathContainsEncodingError() throws IOException {
+        final String path = "%a";
+        final RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withPath(path).build();
+        final IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> RestUtils.decodeComponent(request.rawPath()));
+        final RestChannel channel = new DetailedExceptionRestChannel(request);
+        // if we try to decode the path, this will throw an IllegalArgumentException again
+        final RestResponse response = new RestResponse(channel, e);
+        assertNotNull(response.content());
+        final String content = response.content().utf8ToString();
+        assertThat(content, containsString("\"type\":\"illegal_argument_exception\""));
+        assertThat(content, containsString("\"reason\":\"partial escape sequence at end of string: %a\""));
+        assertThat(content, containsString("\"status\":" + 400));
+    }
+
+    public void testResponseWhenInternalServerError() throws IOException {
+        final RestRequest request = new FakeRestRequest();
+        final RestChannel channel = new DetailedExceptionRestChannel(request);
+        final RestResponse response = new RestResponse(channel, new ElasticsearchException("simulated"));
+        assertNotNull(response.content());
+        final String content = response.content().utf8ToString();
+        assertThat(content, containsString("\"type\":\"exception\""));
+        assertThat(content, containsString("\"reason\":\"simulated\""));
+        assertThat(content, containsString("\"status\":" + 500));
+    }
+
+    public void testErrorToAndFromXContent() throws IOException {
+        final boolean detailed = randomBoolean();
+
+        Exception original;
+        ElasticsearchException cause = null;
+        String reason;
+        String type = "exception";
+        RestStatus status = RestStatus.INTERNAL_SERVER_ERROR;
+        boolean addHeadersOrMetadata = false;
+
+        switch (randomIntBetween(0, 5)) {
+            case 0 -> {
+                original = new ElasticsearchException("ElasticsearchException without cause");
+                if (detailed) {
+                    addHeadersOrMetadata = randomBoolean();
+                }
+                reason = "ElasticsearchException without cause";
+            }
+            case 1 -> {
+                original = new ElasticsearchException("ElasticsearchException with a cause", new FileNotFoundException("missing"));
+                if (detailed) {
+                    addHeadersOrMetadata = randomBoolean();
+                    cause = new ElasticsearchException("Elasticsearch exception [type=file_not_found_exception, reason=missing]");
+                }
+                type = "exception";
+                reason = "ElasticsearchException with a cause";
+            }
+            case 2 -> {
+                original = new ResourceNotFoundException("ElasticsearchException with custom status");
+                status = RestStatus.NOT_FOUND;
+                if (detailed) {
+                    addHeadersOrMetadata = randomBoolean();
+                }
+                type = "resource_not_found_exception";
+                reason = "ElasticsearchException with custom status";
+            }
+            case 3 -> {
+                TransportAddress address = buildNewFakeTransportAddress();
+                original = new RemoteTransportException(
+                    "remote",
+                    address,
+                    "action",
+                    new ResourceAlreadyExistsException("ElasticsearchWrapperException with a cause that has a custom status")
+                );
+                status = RestStatus.BAD_REQUEST;
+                type = "resource_already_exists_exception";
+                reason = "ElasticsearchWrapperException with a cause that has a custom status";
+            }
+            case 4 -> {
+                original = new RemoteTransportException(
+                    "ElasticsearchWrapperException with a cause that has a special treatment",
+                    new IllegalArgumentException("wrong")
+                );
+                status = RestStatus.BAD_REQUEST;
+                type = "illegal_argument_exception";
+                reason = "wrong";
+            }
+            case 5 -> {
+                status = randomFrom(RestStatus.values());
+                original = new ElasticsearchStatusException("ElasticsearchStatusException with random status", status);
+                if (detailed) {
+                    addHeadersOrMetadata = randomBoolean();
+                }
+                type = "status_exception";
+                reason = "ElasticsearchStatusException with random status";
+            }
+            default -> throw new UnsupportedOperationException("Failed to generate random exception");
+        }
+
+        String message = "Elasticsearch exception [type=" + type + ", reason=" + reason + "]";
+        ElasticsearchStatusException expected = new ElasticsearchStatusException(message, status, cause);
+
+        if (addHeadersOrMetadata) {
+            ElasticsearchException originalException = ((ElasticsearchException) original);
+            if (randomBoolean()) {
+                originalException.addBodyHeader("foo", "bar", "baz");
+                expected.addBodyHeader("foo", "bar", "baz");
+            }
+            if (randomBoolean()) {
+                originalException.addMetadata("es.metadata_0", "0");
+                expected.addMetadata("es.metadata_0", "0");
+            }
+            if (randomBoolean()) {
+                String resourceType = randomAlphaOfLength(5);
+                String resourceId = randomAlphaOfLength(5);
+                originalException.setResources(resourceType, resourceId);
+                expected.setResources(resourceType, resourceId);
+            }
+            if (randomBoolean()) {
+                originalException.setIndex("_index");
+                expected.setIndex("_index");
+            }
+        }
+
+        final XContentType xContentType = randomFrom(XContentType.values());
+
+        Map<String, String> params = Collections.singletonMap("format", xContentType.queryParameter());
+        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withParams(params).build();
+        RestChannel channel = detailed ? new DetailedExceptionRestChannel(request) : new SimpleExceptionRestChannel(request);
+
+        RestResponse response = new RestResponse(channel, original);
+
+        ElasticsearchException parsedError;
+        try (XContentParser parser = createParser(xContentType.xContent(), response.content())) {
+            parsedError = errorFromXContent(parser);
+            assertNull(parser.nextToken());
+        }
+
+        assertEquals(expected.status(), parsedError.status());
+        assertDeepEquals(expected, parsedError);
+    }
+
+    public void testNoErrorFromXContent() throws IOException {
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> {
+            try (XContentBuilder builder = XContentBuilder.builder(randomFrom(XContentType.values()).xContent())) {
+                builder.startObject();
+                builder.field("status", randomFrom(RestStatus.values()).getStatus());
+                builder.endObject();
+
+                try (XContentParser parser = createParser(builder.contentType().xContent(), BytesReference.bytes(builder))) {
+                    errorFromXContent(parser);
+                }
+            }
+        });
+        assertEquals("Failed to parse elasticsearch status exception: no exception was found", e.getMessage());
+    }
+
+    private static ElasticsearchStatusException errorFromXContent(XContentParser parser) throws IOException {
+        XContentParser.Token token = parser.nextToken();
+        ensureExpectedToken(XContentParser.Token.START_OBJECT, token, parser);
+
+        ElasticsearchException exception = null;
+        RestStatus status = null;
+
+        String currentFieldName = null;
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == XContentParser.Token.FIELD_NAME) {
+                currentFieldName = parser.currentName();
+            }
+            if (RestResponse.STATUS.equals(currentFieldName)) {
+                if (token != XContentParser.Token.FIELD_NAME) {
+                    ensureExpectedToken(XContentParser.Token.VALUE_NUMBER, token, parser);
+                    status = RestStatus.fromCode(parser.intValue());
+                }
+            } else {
+                exception = ElasticsearchException.failureFromXContent(parser);
+            }
+        }
+
+        if (exception == null) {
+            throw new IllegalStateException("Failed to parse elasticsearch status exception: no exception was found");
+        }
+
+        ElasticsearchStatusException result = new ElasticsearchStatusException(exception.getMessage(), status, exception.getCause());
+        for (String header : exception.getBodyHeaderKeys()) {
+            result.addBodyHeader(header, exception.getBodyHeader(header));
+        }
+        for (String metadata : exception.getMetadataKeys()) {
+            result.addMetadata(metadata, exception.getMetadata(metadata));
+        }
+        return result;
+    }
+
+    public void testResponseContentTypeUponException() throws Exception {
+        String mediaType = XContentType.VND_JSON.toParsedMediaType()
+            .responseContentTypeHeader(
+                Map.of(MediaType.COMPATIBLE_WITH_PARAMETER_NAME, String.valueOf(RestApiVersion.minimumSupported().major))
+            );
+        List<String> mediaTypeList = Collections.singletonList(mediaType);
+
+        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withHeaders(Map.of("Accept", mediaTypeList)).build();
+        RestChannel channel = new SimpleExceptionRestChannel(request);
+
+        Exception t = new ElasticsearchException("an error occurred reading data", new FileNotFoundException("/foo/bar"));
+        RestResponse response = new RestResponse(channel, t);
+        assertThat(response.contentType(), equalTo(mediaType));
+        assertWarnings(
+            "The JSON format of non-detailed errors has changed in Elasticsearch 9.0 to match the JSON structure used for detailed errors."
+        );
+    }
+
+    public void testSupressedLogging() throws IOException {
+        final RestRequest request = new FakeRestRequest();
+        final RestChannel channel = new DetailedExceptionRestChannel(request);
+        // setting "rest.exception.stacktrace.skip" to true shouldn't change the default behaviour
+        if (randomBoolean()) {
+            request.params().put(REST_EXCEPTION_SKIP_STACK_TRACE, "true");
+        }
+        assertLogging(channel, new ElasticsearchException("simulated"), Level.WARN, "500", "simulated");
+        assertLogging(channel, new IllegalArgumentException("simulated_iae"), Level.DEBUG, "400", "simulated_iae");
+        assertLogging(channel, null, null, null, null);
+        assertLogging(
+            channel,
+            new ElasticsearchSecurityException("unauthorized", RestStatus.UNAUTHORIZED),
+            Level.DEBUG,
+            "401",
+            "unauthorized"
+        );
+
+        // setting "error_trace" to true should not affect logging
+        request.params().clear();
+        request.params().put("error_trace", "true");
+        assertLogging(channel, new ElasticsearchException("simulated"), Level.WARN, "500", "simulated");
+        assertLogging(
+            channel,
+            new ElasticsearchSecurityException("unauthorized", RestStatus.UNAUTHORIZED),
+            Level.DEBUG,
+            "401",
+            "unauthorized"
+        );
+    }
+
+    public void testSuppressedLoggingRecordsRootCause() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(
+            new FakeRestRequest.Builder(xContentRegistry()).withPath("/my-index/_search").build()
+        );
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException("inner")));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("inner", fields.get("elasticsearch.error.root_cause.message"));
+        assertEquals("/my-index/_search", fields.get("url.path"));
+        assertEquals(500, fields.get("http.response.status_code"));
+        assertFalse(fields.containsKey("elasticsearch.error.index"));
+        assertFalse(fields.containsKey("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingOmitsAbsentRootCauseMessage() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException()));
+
+        assertFalse(lastLoggedFields().containsKey("elasticsearch.error.root_cause.message"));
+    }
+
+    public void testSuppressedLoggingRecordsIndexAndShard() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, new ElasticsearchException("outer", new ShardNotFoundException(new ShardId("my-index", "uuid", 3))));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals("my-index", fields.get("elasticsearch.error.index"));
+        assertEquals(3, fields.get("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingRecordsIndexWhenRootCauseIsNotScoped() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardId shardId = new ShardId("my-index", "uuid", 3);
+
+        new RestResponse(channel, new ShardNotFoundException(shardId, "no such shard", new IllegalStateException("engine is closed")));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("engine is closed", fields.get("elasticsearch.error.root_cause.message"));
+        assertEquals("my-index", fields.get("elasticsearch.error.index"));
+        assertEquals(3, fields.get("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingRecordsRootCauseBehindAllShardsFailed() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardId shardId = new ShardId("my-index", "uuid", 3);
+        final ShardSearchFailure shardFailure = new ShardSearchFailure(
+            new ShardNotFoundException(shardId),
+            new SearchShardTarget("node", shardId, null)
+        );
+
+        new RestResponse(
+            channel,
+            new SearchPhaseExecutionException("query", "all shards failed", new ShardSearchFailure[] { shardFailure })
+        );
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(ShardNotFoundException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("my-index", fields.get("elasticsearch.error.index"));
+    }
+
+    public void testSuppressedLoggingRecordsHandlerName() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest()) {
+            @Override
+            public String handlerName() {
+                return "search_action";
+            }
+        };
+
+        new RestResponse(channel, new ElasticsearchException("simulated"));
+
+        assertEquals("search_action", lastLoggedFields().get("elasticsearch.rest.handler"));
+    }
+
+    public void testSuppressedLoggingOmitsUnknownHandlerName() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, new ElasticsearchException("simulated"));
+
+        assertFalse(lastLoggedFields().containsKey("elasticsearch.rest.handler"));
+    }
+
+    public void testSuppressedLoggingWithTwoDifferentShardFailures() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure[] failures = new ShardSearchFailure[] {
+            new ShardSearchFailure(
+                new IllegalStateException("engine is closed"),
+                new SearchShardTarget("node-0", new ShardId("my-index", "uuid", 0), null)
+            ),
+            new ShardSearchFailure(
+                new IllegalArgumentException("bad argument"),
+                new SearchShardTarget("node-1", new ShardId("other-index", "uuid", 1), null)
+            ) };
+
+        new RestResponse(channel, new SearchPhaseExecutionException("query", "all shards failed", failures));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        // NOTE: guessFirstRootCause returns on the first shard failure, so root_cause describes that one
+        assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("engine is closed", fields.get("elasticsearch.error.root_cause.message"));
+        assertEquals("my-index", fields.get("elasticsearch.error.index"));
+        assertEquals(0, fields.get("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingKeepsPlainTextMessage() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(
+            new FakeRestRequest.Builder(xContentRegistry()).withPath("/my-index/_search").build()
+        );
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException("inner")));
+
+        final PatternLayout layout = PatternLayout.newBuilder().withPattern("%m").withAlwaysWriteExceptions(false).build();
+        assertEquals("path: /my-index/_search, params: {}, status: 500", layout.toSerializable(appender.getLastEventAndReset()));
+    }
+
+    public void testSuppressedLoggingRecordsWrappedSearchFailureLocation() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure shardFailure = new ShardSearchFailure(
+            new IllegalStateException("engine is closed"),
+            new SearchShardTarget("node", new ShardId("my-index", "uuid", 3), null)
+        );
+        final SearchPhaseExecutionException searchFailure = new SearchPhaseExecutionException(
+            "query",
+            "all shards failed",
+            new ShardSearchFailure[] { shardFailure }
+        );
+
+        new RestResponse(channel, new RemoteTransportException("error while communicating with remote cluster [remote]", searchFailure));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("my-index", fields.get("elasticsearch.error.index"));
+        assertEquals(3, fields.get("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingOmitsLocationForCoordinatorFailure() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure shardFailure = new ShardSearchFailure(
+            new IllegalArgumentException("unrelated shard failure"),
+            new SearchShardTarget("node", new ShardId("my-index", "uuid", 3), null)
+        );
+
+        new RestResponse(
+            channel,
+            new SearchPhaseExecutionException(
+                "fetch",
+                "Phase failed",
+                new IllegalStateException("coordinator failure"),
+                new ShardSearchFailure[] { shardFailure }
+            )
+        );
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals("coordinator failure", fields.get("elasticsearch.error.root_cause.message"));
+        assertFalse(fields.containsKey("elasticsearch.error.index"));
+        assertFalse(fields.containsKey("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingRecordsIndexWithoutShard() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, new IndexClosedException(new Index("my-index", "uuid")));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals("my-index", fields.get("elasticsearch.error.index"));
+        assertFalse(fields.containsKey("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingSerialisesToEcsJson() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(
+            new FakeRestRequest.Builder(xContentRegistry()).withPath("/my-index/_search").build()
+        );
+        final String awkward = "quote \" backslash \\ newline \n end";
+
+        new RestResponse(
+            channel,
+            new ElasticsearchException("outer", new ShardNotFoundException(new ShardId("my-index", "uuid", 3), awkward))
+        );
+
+        final EcsLayout layout = EcsLayout.newBuilder()
+            .setConfiguration(LoggerContext.getContext(false).getConfiguration())
+            .setEventDataset("elasticsearch.server")
+            .build();
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), layout.toSerializable(appender.getLastEventAndReset()))) {
+            final Map<String, Object> fields = parser.map();
+            assertEquals("path: /my-index/_search, params: {}, status: 500", fields.get("message"));
+            assertEquals(ElasticsearchException.class.getName(), fields.get("error.type"));
+            assertEquals("outer", fields.get("error.message"));
+            assertEquals(500, fields.get("http.response.status_code"));
+            assertEquals(ShardNotFoundException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+            assertEquals(awkward, fields.get("elasticsearch.error.root_cause.message"));
+            assertEquals(3, fields.get("elasticsearch.error.shard"));
+            assertFalse(fields.containsKey("elasticsearch.rest.handler"));
+
+            final String stackTrace = (String) fields.get("error.stack_trace");
+            assertThat(stackTrace, containsString("Caused by: "));
+            assertThat(stackTrace, containsString(ShardNotFoundException.class.getName()));
+            assertThat(stackTrace, containsString(awkward));
+        }
+    }
+
+    public void testWalkCauseChain() {
+        final RuntimeException root = new RuntimeException("root");
+        assertThat(RestResponse.walkCauseChain(root).deepest(), sameInstance(root));
+        assertNull(RestResponse.walkCauseChain(root).indexScoped());
+
+        Throwable wrapped = root;
+        for (int i = 0; i < randomIntBetween(1, 32); i++) {
+            wrapped = new RuntimeException("wrapper", wrapped);
+        }
+        assertThat(RestResponse.walkCauseChain(wrapped).deepest(), sameInstance(root));
+    }
+
+    public void testWalkCauseChainIgnoresSuppressed() {
+        final RuntimeException root = new RuntimeException("root");
+        final RuntimeException outer = new RuntimeException("outer", root);
+        outer.addSuppressed(new ShardNotFoundException(new ShardId("suppressed-index", "uuid", 7)));
+
+        final RestResponse.CauseChain chain = RestResponse.walkCauseChain(outer);
+
+        assertThat(chain.deepest(), sameInstance(root));
+        assertNull(chain.indexScoped());
+    }
+
+    public void testWalkCauseChainOfCycle() {
+        final RuntimeException e1 = new RuntimeException();
+        final RuntimeException e2 = new RuntimeException(e1);
+        e1.initCause(e2);
+        assertThat(RestResponse.walkCauseChain(e1).deepest(), sameInstance(e2));
+        assertThat(RestResponse.walkCauseChain(e2).deepest(), sameInstance(e1));
+    }
+
+    public void testWalkCauseChainFindsDeepestIndexScopedCause() {
+        final ShardNotFoundException deep = new ShardNotFoundException(
+            new ShardId("deep-index", "uuid", 3),
+            "no such shard",
+            new IllegalStateException("engine is closed")
+        );
+        final ShardNotFoundException shallow = new ShardNotFoundException(new ShardId("shallow-index", "uuid", 0), "no such shard", deep);
+
+        final RestResponse.CauseChain chain = RestResponse.walkCauseChain(new RuntimeException("outer", shallow));
+
+        assertThat(chain.deepest(), instanceOf(IllegalStateException.class));
+        assertThat(chain.indexScoped(), sameInstance(deep));
+    }
+
+    public void testSuppressedLoggingOmitsFallbackLocationAcrossTransport() throws IOException {
+        final ShardSearchFailure shardFailure = new ShardSearchFailure(
+            new IllegalStateException("engine is closed"),
+            new SearchShardTarget("node", new ShardId("my-index", "uuid", 3), null)
+        );
+        final SearchPhaseExecutionException searchFailure = new SearchPhaseExecutionException(
+            "query",
+            "all shards failed",
+            new ShardSearchFailure[] { shardFailure }
+        );
+        final Exception received;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeException(new RemoteTransportException("remote search failure", searchFailure));
+            try (StreamInput in = out.bytes().streamInput()) {
+                received = in.readException();
+            }
+        }
+
+        new RestResponse(new DetailedExceptionRestChannel(new FakeRestRequest()), received);
+
+        // NOTE: serialization rebuilds the cause and the shard failures separately, so the fallback can no longer tell that
+        // they describe the same failure. A location carried on the cause chain itself still survives, as it is metadata
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("engine is closed", fields.get("elasticsearch.error.root_cause.message"));
+        assertFalse(fields.containsKey("elasticsearch.error.index"));
+        assertFalse(fields.containsKey("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingOmitsLocationForIndistinguishableFailures() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure shardFailure = new ShardSearchFailure(
+            new IllegalStateException("engine is closed"),
+            new SearchShardTarget("node", new ShardId("my-index", "uuid", 3), null)
+        );
+
+        new RestResponse(
+            channel,
+            new SearchPhaseExecutionException(
+                "fetch",
+                "Phase failed",
+                new IllegalStateException("engine is closed"),
+                new ShardSearchFailure[] { shardFailure }
+            )
+        );
+
+        // NOTE: the coordinator failure and the shard failure share a class and a message but are unrelated, so comparing those
+        // rather than identity would attribute the failure to a shard it did not happen on
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals("engine is closed", fields.get("elasticsearch.error.root_cause.message"));
+        assertFalse(fields.containsKey("elasticsearch.error.index"));
+        assertFalse(fields.containsKey("elasticsearch.error.shard"));
+    }
+
+    public void testSuppressedLoggingSerialisesToLegacyJson() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(
+            new FakeRestRequest.Builder(xContentRegistry()).withPath("/my-index/_search").build()
+        );
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException("inner")));
+
+        final ESJsonLayout layout = ESJsonLayout.newBuilder().setType("server").build();
+        // NOTE: a duplicate message key surfaces as a parse failure rather than a wrong value
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), layout.toSerializable(appender.getLastEventAndReset()))) {
+            final Map<String, Object> fields = parser.map();
+            assertEquals("path: /my-index/_search, params: {}, status: 500", fields.get("message"));
+            assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        }
+    }
+
+    public void testSuppressedLoggingSerialisesToLegacyJsonWithOverriddenMessage() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(
+            new FakeRestRequest.Builder(xContentRegistry()).withPath("/my-index/_search").build()
+        );
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException("inner")));
+
+        // NOTE: this configuration tells the layout not to write its own message and to take it from the map instead
+        final ESJsonLayout layout = ESJsonLayout.createLayout(
+            "server",
+            StandardCharsets.UTF_8,
+            new String[] { "message" },
+            LoggerContext.getContext(false).getConfiguration()
+        );
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), layout.toSerializable(appender.getLastEventAndReset()))) {
+            final Map<String, Object> fields = parser.map();
+            assertEquals("path: /my-index/_search, params: {}, status: 500", fields.get("message"));
+            assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        }
+    }
+
+    public void testSuppressedLoggingRecordsRootCauseWithErrorTrace() throws IOException {
+        final RestRequest request = new FakeRestRequest();
+        request.params().put("error_trace", "true");
+        final RestChannel channel = new DetailedExceptionRestChannel(request);
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException("inner")));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(IllegalStateException.class.getName(), fields.get("elasticsearch.error.root_cause.type"));
+        assertEquals("inner", fields.get("elasticsearch.error.root_cause.message"));
+    }
+
+    public void testSuppressedLoggingRecordsOneShardFailure() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, searchFailure(shardFailure("my-index", 0, new IllegalStateException("engine is closed"))));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(1, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(1, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(
+            List.of(
+                Map.of(
+                    "type",
+                    IllegalStateException.class.getName(),
+                    "message",
+                    "engine is closed",
+                    "index",
+                    "my-index",
+                    "shard",
+                    0,
+                    "node",
+                    "node-0"
+                )
+            ),
+            fields.get("elasticsearch.error.shard_failures")
+        );
+    }
+
+    public void testSuppressedLoggingRecordsShardFailuresBelowTheCap() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(
+            channel,
+            searchFailure(
+                shardFailure("my-index", 0, new IllegalStateException("engine is closed")),
+                shardFailure("other-index", 1, new IllegalArgumentException("bad argument"))
+            )
+        );
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(2, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(2, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(
+            List.of(
+                Map.of(
+                    "type",
+                    IllegalStateException.class.getName(),
+                    "message",
+                    "engine is closed",
+                    "index",
+                    "my-index",
+                    "shard",
+                    0,
+                    "node",
+                    "node-0"
+                ),
+                Map.of(
+                    "type",
+                    IllegalArgumentException.class.getName(),
+                    "message",
+                    "bad argument",
+                    "index",
+                    "other-index",
+                    "shard",
+                    1,
+                    "node",
+                    "node-1"
+                )
+            ),
+            fields.get("elasticsearch.error.shard_failures")
+        );
+    }
+
+    public void testSuppressedLoggingTruncatesShardFailuresAboveTheCap() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final int failureCount = randomIntBetween(11, 40);
+        final ShardSearchFailure[] failures = new ShardSearchFailure[failureCount];
+        for (int i = 0; i < failureCount; i++) {
+            failures[i] = shardFailure("index-" + i, i, new IllegalStateException("failure " + i));
+        }
+
+        new RestResponse(channel, searchFailure(failures));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(failureCount, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(failureCount, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        final List<?> reported = (List<?>) fields.get("elasticsearch.error.shard_failures");
+        assertEquals(10, reported.size());
+        for (int i = 0; i < reported.size(); i++) {
+            assertEquals(
+                Map.of(
+                    "type",
+                    IllegalStateException.class.getName(),
+                    "message",
+                    "failure " + i,
+                    "index",
+                    "index-" + i,
+                    "shard",
+                    i,
+                    "node",
+                    "node-" + i
+                ),
+                reported.get(i)
+            );
+        }
+    }
+
+    public void testSuppressedLoggingDeduplicatesIdenticalShardFailures() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final int shardCount = randomIntBetween(2, 50);
+        final ShardSearchFailure[] failures = new ShardSearchFailure[shardCount];
+        for (int i = 0; i < shardCount; i++) {
+            failures[i] = shardFailure("my-index", i, new IllegalStateException("engine is closed"));
+        }
+
+        new RestResponse(channel, searchFailure(failures));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(shardCount, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(1, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(
+            List.of(
+                Map.of(
+                    "type",
+                    IllegalStateException.class.getName(),
+                    "message",
+                    "engine is closed",
+                    "index",
+                    "my-index",
+                    "shard",
+                    0,
+                    "node",
+                    "node-0"
+                )
+            ),
+            fields.get("elasticsearch.error.shard_failures")
+        );
+    }
+
+    public void testSuppressedLoggingRecordsShardFailuresAtTheCap() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure[] failures = new ShardSearchFailure[10];
+        for (int i = 0; i < failures.length; i++) {
+            failures[i] = shardFailure("index-" + i, i, new IllegalStateException("failure " + i));
+        }
+
+        new RestResponse(channel, searchFailure(failures));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(10, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(10, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(10, ((List<?>) fields.get("elasticsearch.error.shard_failures")).size());
+    }
+
+    public void testShardFailuresOmitLocationWhenTheTargetIsUnknown() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, searchFailure(new ShardSearchFailure(new IllegalStateException("engine is closed"))));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(1, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(1, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(
+            List.of(Map.of("type", IllegalStateException.class.getName(), "message", "engine is closed")),
+            fields.get("elasticsearch.error.shard_failures")
+        );
+    }
+
+    public void testShardFailuresOmitNodeWhenTheNodeIsUnknown() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure failure = new ShardSearchFailure(
+            new IllegalStateException("engine is closed"),
+            new SearchShardTarget(null, new ShardId("my-index", "uuid", 3), null)
+        );
+
+        new RestResponse(channel, searchFailure(failure));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(
+            List.of(Map.of("type", IllegalStateException.class.getName(), "message", "engine is closed", "index", "my-index", "shard", 3)),
+            fields.get("elasticsearch.error.shard_failures")
+        );
+    }
+
+    public void testShardFailuresDistinguishRootCausesBehindOneWrapper() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(
+            channel,
+            searchFailure(
+                shardFailure("my-index", 0, new ElasticsearchException("wrapped", new NullPointerException("npe"))),
+                shardFailure("my-index", 1, new ElasticsearchException("wrapped", new IllegalStateException("ise")))
+            )
+        );
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(2, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(2, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(
+            List.of(
+                expectedFailure(NullPointerException.class, "npe", "my-index", 0),
+                expectedFailure(IllegalStateException.class, "ise", "my-index", 1)
+            ),
+            shardFailuresIn(fields)
+        );
+    }
+
+    public void testShardFailuresGroupBeforeApplyingTheCap() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure[] failures = new ShardSearchFailure[100];
+        for (int i = 0; i < failures.length; i++) {
+            failures[i] = shardFailure(i < 50 ? "my-index" : "other-index", i, new IllegalStateException("engine is closed"));
+        }
+
+        new RestResponse(channel, searchFailure(failures));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(100, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(2, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        assertEquals(
+            List.of(
+                expectedFailure(IllegalStateException.class, "engine is closed", "my-index", 0),
+                expectedFailure(IllegalStateException.class, "engine is closed", "other-index", 50)
+            ),
+            shardFailuresIn(fields)
+        );
+    }
+
+    public void testShardFailuresAboveTheCapReportDistinctMembers() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, searchFailure(failuresOnDistinctIndices(11)));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertEquals(11, fields.get("elasticsearch.error.shard_failure_count"));
+        assertEquals(11, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+        final List<?> reported = shardFailuresIn(fields);
+        assertEquals(10, reported.size());
+        assertEquals(10, Set.copyOf(reported).size());
+        final List<Map<String, Object>> everyFailure = new ArrayList<>();
+        for (int i = 0; i < 11; i++) {
+            everyFailure.add(expectedFailure(IllegalStateException.class, "failure " + i, "index-" + i, i));
+        }
+        assertTrue(everyFailure.containsAll(reported));
+    }
+
+    public void testRootCauseIsUnchangedByAdditionalShardFailures() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final ShardSearchFailure[] many = failuresOnDistinctIndices(11);
+
+        new RestResponse(channel, searchFailure(many[0]));
+        final Map<String, ?> single = Map.copyOf(lastLoggedFields());
+
+        new RestResponse(channel, searchFailure(many));
+        final Map<String, ?> multiple = lastLoggedFields();
+
+        for (String field : List.of(
+            "error.type",
+            "error.message",
+            "elasticsearch.error.root_cause.type",
+            "elasticsearch.error.root_cause.message",
+            "elasticsearch.error.index",
+            "elasticsearch.error.shard",
+            "http.response.status_code",
+            "url.path"
+        )) {
+            assertEquals(field, single.get(field), multiple.get(field));
+        }
+    }
+
+    public void testSuppressedLoggingOmitsShardFailuresWhenThereAreNone() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, new ElasticsearchException("outer", new IllegalStateException("inner")));
+
+        final Map<String, ?> fields = lastLoggedFields();
+        assertFalse(fields.containsKey("elasticsearch.error.shard_failure_count"));
+        assertFalse(fields.containsKey("elasticsearch.error.distinct_shard_failure_count"));
+        assertFalse(fields.containsKey("elasticsearch.error.shard_failures"));
+    }
+
+    public void testShardFailuresSerialiseToEcsJson() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+
+        new RestResponse(channel, searchFailure(shardFailure("my-index", 3, new IllegalStateException("engine is closed"))));
+
+        final EcsLayout layout = EcsLayout.newBuilder()
+            .setConfiguration(LoggerContext.getContext(false).getConfiguration())
+            .setEventDataset("elasticsearch.server")
+            .build();
+        final String serialised = layout.toSerializable(appender.getLastEventAndReset());
+        assertThat(serialised, not(containsString("{type=")));
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), serialised)) {
+            final Map<String, Object> fields = parser.map();
+            assertEquals(1, fields.get("elasticsearch.error.shard_failure_count"));
+            assertEquals(1, fields.get("elasticsearch.error.distinct_shard_failure_count"));
+            assertEquals(
+                List.of(
+                    Map.of(
+                        "type",
+                        IllegalStateException.class.getName(),
+                        "message",
+                        "engine is closed",
+                        "index",
+                        "my-index",
+                        "shard",
+                        3,
+                        "node",
+                        "node-3"
+                    )
+                ),
+                fields.get("elasticsearch.error.shard_failures")
+            );
+        }
+    }
+
+    public void testShardFailuresSerialiseToLegacyJson() throws IOException {
+        final RestChannel channel = new DetailedExceptionRestChannel(new FakeRestRequest());
+        final String awkward = "say \"hi\" \\ then\nnew\ttab \u00e9";
+
+        new RestResponse(channel, searchFailure(shardFailure("my-index", 3, new IllegalStateException(awkward))));
+
+        final ESJsonLayout layout = ESJsonLayout.newBuilder().setType("server").build();
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), layout.toSerializable(appender.getLastEventAndReset()))) {
+            final Map<String, Object> fields = parser.map();
+            assertEquals(
+                List.of(
+                    Map.of(
+                        "type",
+                        IllegalStateException.class.getName(),
+                        "message",
+                        awkward,
+                        "index",
+                        "my-index",
+                        "shard",
+                        "3",
+                        "node",
+                        "node-3"
+                    )
+                ),
+                fields.get("elasticsearch.error.shard_failures")
+            );
+        }
+    }
+
+    private static ShardSearchFailure shardFailure(String index, int shard, Exception cause) {
+        return shardFailure(index, shard, "node-" + shard, cause);
+    }
+
+    private static ShardSearchFailure shardFailure(String index, int shard, String node, Exception cause) {
+        return new ShardSearchFailure(cause, new SearchShardTarget(node, new ShardId(index, "uuid", shard), null));
+    }
+
+    private static ShardSearchFailure[] failuresOnDistinctIndices(int count) {
+        final ShardSearchFailure[] failures = new ShardSearchFailure[count];
+        for (int i = 0; i < count; i++) {
+            failures[i] = shardFailure("index-" + i, i, new IllegalStateException("failure " + i));
+        }
+        return failures;
+    }
+
+    private static Map<String, Object> expectedFailure(Class<? extends Throwable> type, String message, String index, int shard) {
+        return Map.of("type", type.getName(), "message", message, "index", index, "shard", shard, "node", "node-" + shard);
+    }
+
+    private static List<?> shardFailuresIn(Map<String, ?> fields) {
+        return (List<?>) fields.get("elasticsearch.error.shard_failures");
+    }
+
+    private static SearchPhaseExecutionException searchFailure(ShardSearchFailure... failures) {
+        return new SearchPhaseExecutionException("query", "all shards failed", failures);
+    }
+
+    private Map<String, ?> lastLoggedFields() {
+        final LogEvent logEvent = appender.getLastEventAndReset();
+        assertThat(logEvent.getMessage(), instanceOf(MapMessage.class));
+        return ((MapMessage<?, ?>) logEvent.getMessage()).getData();
+    }
+
+    private void assertLogging(
+        RestChannel channel,
+        Exception exception,
+        Level expectedLogLevel,
+        String expectedStatus,
+        String expectedExceptionMessage
+    ) throws IOException {
+        RestResponse response = new RestResponse(channel, exception);
+        assertNotNull(response.content());
+        LogEvent logEvent = appender.getLastEventAndReset();
+        if (expectedLogLevel != null) {
+            assertThat(logEvent.getLevel(), is(expectedLogLevel));
+            assertThat(
+                logEvent.getMessage().getFormattedMessage(),
+                is("path: , params: " + channel.request().params() + ", status: " + expectedStatus)
+            );
+            assertThat(logEvent.getThrown().getMessage(), is(expectedExceptionMessage));
+            assertThat(logEvent.getLoggerName(), is("rest.suppressed"));
+        } else {
+            assertNull(logEvent);
+        }
+    }
+
+    public static class WithHeadersException extends ElasticsearchException {
+
+        WithHeadersException() {
+            super("");
+            this.addBodyHeader("n1", "v11", "v12");
+            this.addBodyHeader("n2", "v21", "v22");
+            this.addHttpHeader("My-Header", "v1");
+            this.addMetadata("es.test", "value1", "value2");
+        }
+
+        @Override
+        public RestStatus status() {
+            return RestStatus.BAD_REQUEST;
+        }
+    }
+
+    private static class SimpleExceptionRestChannel extends AbstractRestChannel {
+
+        SimpleExceptionRestChannel(RestRequest request) {
+            super(request, false);
+        }
+
+        @Override
+        public void sendResponse(RestResponse response) {}
+    }
+
+    private static class DetailedExceptionRestChannel extends AbstractRestChannel {
+
+        DetailedExceptionRestChannel(RestRequest request) {
+            super(request, true);
+        }
+
+        @Override
+        public void sendResponse(RestResponse response) {}
+    }
+}
