@@ -1,2 +1,3 @@
 name	url	commit	files	bytes
 linux	https://github.com/torvalds/linux.git	6628e7d4c6b25c8d18f1345e3a20d21829aae7e4	96508	1671903603
+llvm-project	https://github.com/llvm/llvm-project.git	f736bb6506716f6054229a18213990ef27218e9d	181365	2371267805
