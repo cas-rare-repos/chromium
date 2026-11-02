@@ -12,3 +12,4 @@ go	https://github.com/golang/go.git	babb75be8cd5a3b1cd1a34fd837225cbef659d10	116
 kubernetes	https://github.com/kubernetes/kubernetes.git	c5bdf2219eea569d6b973d224822f2a56c63d007	18922	219010194
 tensorflow	https://github.com/tensorflow/tensorflow.git	71724b0e705c78bc9dedb414b3848423343aee1a	25832	239677919
 elasticsearch	https://github.com/elastic/elasticsearch.git	3251bbfeaa07490d3f13fa3406dda43ac9e547b6	49772	497889888
+odoo	https://github.com/odoo/odoo.git	f364f1de4081d5cf94be9fbfa0e082bc6b5a754a	17272	371370844
